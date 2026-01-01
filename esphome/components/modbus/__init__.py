@@ -6,7 +6,7 @@ from esphome import pins
 import esphome.codegen as cg
 from esphome.components import uart
 import esphome.config_validation as cv
-from esphome.const import CONF_ADDRESS, CONF_DISABLE_CRC, CONF_FLOW_CONTROL_PIN, CONF_ID
+from esphome.const import CONF_ADDRESS, CONF_FLOW_CONTROL_PIN, CONF_ID
 from esphome.cpp_helpers import gpio_pin_expression
 import esphome.final_validate as fv
 
@@ -14,12 +14,17 @@ DEPENDENCIES = ["uart"]
 
 modbus_ns = cg.esphome_ns.namespace("modbus")
 Modbus = modbus_ns.class_("Modbus", cg.Component, uart.UARTDevice)
+ModbusServer = modbus_ns.class_("ModbusServerHub", Modbus)
+ModbusClient = modbus_ns.class_("ModbusClientHub", Modbus)
 ModbusDevice = modbus_ns.class_("ModbusDevice")
+ModbusClientDevice = modbus_ns.class_("ModbusClientDevice")
+ModbusServerDevice = modbus_ns.class_("ModbusServerDevice")
 MULTI_CONF = True
 
 CONF_ROLE = "role"
 CONF_MODBUS_ID = "modbus_id"
 CONF_SEND_WAIT_TIME = "send_wait_time"
+CONF_TURNAROUND_TIME = "turnaround_time"
 
 ModbusRole = modbus_ns.enum("ModbusRole")
 MODBUS_ROLES = {
@@ -27,20 +32,33 @@ MODBUS_ROLES = {
     "server": ModbusRole.SERVER,
 }
 
-CONFIG_SCHEMA = (
-    cv.Schema(
-        {
-            cv.GenerateID(): cv.declare_id(Modbus),
-            cv.Optional(CONF_ROLE, default="client"): cv.enum(MODBUS_ROLES),
-            cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
-            cv.Optional(
-                CONF_SEND_WAIT_TIME, default="250ms"
-            ): cv.positive_time_period_milliseconds,
-            cv.Optional(CONF_DISABLE_CRC, default=False): cv.boolean,
-        }
-    )
-    .extend(cv.COMPONENT_SCHEMA)
-    .extend(uart.UART_DEVICE_SCHEMA)
+CONFIG_SCHEMA = cv.typed_schema(
+    {
+        "client": cv.Schema(
+            {
+                cv.GenerateID(): cv.declare_id(ModbusClient),
+                cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
+                cv.Optional(
+                    CONF_SEND_WAIT_TIME, default="2000ms"
+                ): cv.positive_time_period_milliseconds,
+                cv.Optional(
+                    CONF_TURNAROUND_TIME, default="600ms"
+                ): cv.positive_time_period_milliseconds,
+            }
+        )
+        .extend(cv.COMPONENT_SCHEMA)
+        .extend(uart.UART_DEVICE_SCHEMA),
+        "server": cv.Schema(
+            {
+                cv.GenerateID(): cv.declare_id(ModbusServer),
+                cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
+            }
+        )
+        .extend(cv.COMPONENT_SCHEMA)
+        .extend(uart.UART_DEVICE_SCHEMA),
+    },
+    key=CONF_ROLE,
+    default_type="client",
 )
 
 
@@ -51,13 +69,15 @@ async def to_code(config):
 
     await uart.register_uart_device(var, config)
 
-    cg.add(var.set_role(config[CONF_ROLE]))
+    uart.request_wake_loop_on_rx()
+
     if CONF_FLOW_CONTROL_PIN in config:
         pin = await gpio_pin_expression(config[CONF_FLOW_CONTROL_PIN])
         cg.add(var.set_flow_control_pin(pin))
 
-    cg.add(var.set_send_wait_time(config[CONF_SEND_WAIT_TIME]))
-    cg.add(var.set_disable_crc(config[CONF_DISABLE_CRC]))
+    if config[CONF_ROLE] == "client":
+        cg.add(var.set_send_wait_time(config[CONF_SEND_WAIT_TIME]))
+        cg.add(var.set_turnaround_time(config[CONF_TURNAROUND_TIME]))
 
 
 def modbus_device_schema(default_address):
@@ -93,8 +113,11 @@ def final_validate_modbus_device(
     )
 
 
-async def register_modbus_device(var, config):
+# Remove the server parameter and extract from config.
+async def register_modbus_device(var, config, server: bool = False):
     parent = await cg.get_variable(config[CONF_MODBUS_ID])
-    cg.add(var.set_parent(parent))
     cg.add(var.set_address(config[CONF_ADDRESS]))
-    cg.add(parent.register_device(var))
+    if server:
+        cg.add(parent.register_device(var))
+    else:
+        cg.add(var.set_parent(parent))

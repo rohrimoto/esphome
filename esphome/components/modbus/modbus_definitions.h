@@ -15,7 +15,7 @@ const uint8_t FUNCTION_CODE_USER_DEFINED_SPACE_2_INIT = 100;  // 0x64
 const uint8_t FUNCTION_CODE_USER_DEFINED_SPACE_2_END = 110;   // 0x6E
 
 enum class ModbusFunctionCode : uint8_t {
-  CUSTOM = 0x00,
+  INVALID = 0x00,
   READ_COILS = 0x01,
   READ_DISCRETE_INPUTS = 0x02,
   READ_HOLDING_REGISTERS = 0x03,
@@ -81,6 +81,12 @@ const uint8_t MAX_NUM_OF_REGISTERS_TO_WRITE = 123;  // 0x7B
 // 6.3 03 (0x03) Read Holding Registers
 // 6.4 04 (0x04) Read Input Registers
 const uint8_t MAX_NUM_OF_REGISTERS_TO_READ = 125;  // 0x7D
+
+// Smallest possible frame is 5 bytes: address(1) + function(1) + exception(1) + CRC(2)
+const uint16_t MIN_SERVER_FRAME_SIZE = 5;
+const uint16_t MIN_CLIENT_FRAME_SIZE = 7;
+const uint16_t MAX_FRAME_SIZE = 256;
+
 /// End of Modbus definitions
 }  // namespace modbus
 }  // namespace esphome

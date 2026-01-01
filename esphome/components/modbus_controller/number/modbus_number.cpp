@@ -8,7 +8,7 @@ namespace modbus_controller {
 static const char *const TAG = "modbus.number";
 
 void ModbusNumber::parse_and_publish(const std::vector<uint8_t> &data) {
-  float result = payload_to_float(data, *this) / this->multiply_by_;
+  float result = payload_to_float(data, this->sensor_value_type, this->offset, this->bitmask) / this->multiply_by_;
 
   // Is there a lambda registered
   // call it with the pre converted value and the raw data array
@@ -48,11 +48,7 @@ void ModbusNumber::control(float value) {
 
   if (!data.empty()) {
     ESP_LOGV(TAG, "Modbus Number write raw: %s", format_hex_pretty(data).c_str());
-    write_cmd = ModbusCommandItem::create_custom_command(
-        this->parent_, data,
-        [this, write_cmd](ModbusRegisterType register_type, uint16_t start_address, const std::vector<uint8_t> &data) {
-          this->parent_->on_write_register_response(write_cmd.register_type, this->start_address, data);
-        });
+    write_cmd = ModbusCommandItem::create_custom_command(this->parent_, data);
   } else {
     data = float_to_payload(write_value, this->sensor_value_type);
 
@@ -72,8 +68,7 @@ void ModbusNumber::control(float value) {
     // publish new value
     write_cmd.on_data_func = [this, write_cmd, value](ModbusRegisterType register_type, uint16_t start_address,
                                                       const std::vector<uint8_t> &data) {
-      // gets called when the write command is ack'd from the device
-      this->parent_->on_write_register_response(write_cmd.register_type, start_address, data);
+      // Republish in case there was a read command in queue before this write
       this->publish_state(value);
     };
   }
