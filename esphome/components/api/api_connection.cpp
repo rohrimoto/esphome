@@ -1126,10 +1126,12 @@ void APIConnection::on_get_time_response(const GetTimeResponse &value) {
   if (homeassistant::global_homeassistant_time != nullptr) {
     homeassistant::global_homeassistant_time->set_epoch_time(value.epoch_seconds);
 #ifdef USE_TIME_TIMEZONE
-    if (!value.timezone.empty()) {
-      // Check if the sender provided pre-parsed timezone data.
-      // If std_offset is non-zero or DST rules are present, the parsed data was populated.
-      // For UTC (all zeros), string parsing produces the same result, so the fallback is equivalent.
+    // Only apply if the sender provided pre-parsed timezone data.
+    // Old clients (before 2026.3.0) only send the timezone string without the parsed struct,
+    // so all parsed_timezone fields default to zero — skip to keep the codegen-configured timezone.
+    // For actual UTC (all zeros), this also skips, which is harmless since UTC is the default.
+    // Eventually the timezone string will be removed and only the struct will be sent.
+    {
       const auto &pt = value.parsed_timezone;
       if (pt.std_offset_seconds != 0 || pt.dst_start.type != enums::DST_RULE_TYPE_NONE) {
         time::ParsedTimezone tz{};
@@ -1148,8 +1150,6 @@ void APIConnection::on_get_time_response(const GetTimeResponse &value) {
         tz.dst_end.week = static_cast<uint8_t>(pt.dst_end.week);
         tz.dst_end.day_of_week = static_cast<uint8_t>(pt.dst_end.day_of_week);
         time::set_global_tz(tz);
-      } else {
-        homeassistant::global_homeassistant_time->set_timezone(value.timezone.c_str(), value.timezone.size());
       }
     }
 #endif
