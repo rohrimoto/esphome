@@ -22,6 +22,27 @@ enum ImageFormat {
   BMP,
 };
 
+struct MimeLookup {
+  const char *mime_type;
+  ImageFormat format;
+};
+
+constexpr MimeLookup MIME_LOOKUP_TABLE[] = {
+#ifdef USE_RUNTIME_IMAGE_BMP
+    {"image/bmp", ImageFormat::BMP},
+#endif
+#ifdef USE_RUNTIME_IMAGE_JPEG
+    {"image/jpeg", ImageFormat::JPEG},
+    {"image/jpg", ImageFormat::JPEG},
+#endif
+#ifdef USE_RUNTIME_IMAGE_PNG
+    {"image/png", ImageFormat::PNG},
+#endif
+    {"image/*", ImageFormat::AUTO}};
+
+const char *get_mime_type_for_format(ImageFormat format);
+std::optional<ImageFormat> get_format_for_mime_type(const char *mime_type);
+
 /**
  * @brief A dynamic image that can be loaded and decoded at runtime.
  *
