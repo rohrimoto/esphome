@@ -14,12 +14,14 @@ class ImageDecoder;
 enum ImageFormat {
   /** Automatically detect. Currently client classes need to implement the detection by themselves.  */
   AUTO,
+  /** BMP format. */
+  BMP,
   /** JPEG format. */
   JPEG,
   /** PNG format. */
   PNG,
-  /** BMP format. */
-  BMP,
+  /** QOI format. */
+  QOI,
 };
 
 struct MimeLookup {
@@ -37,6 +39,9 @@ constexpr MimeLookup MIME_LOOKUP_TABLE[] = {
 #endif
 #ifdef USE_RUNTIME_IMAGE_PNG
     {"image/png", ImageFormat::PNG},
+#endif
+#ifdef USE_RUNTIME_IMAGE_QOI
+    {"image/qoi", ImageFormat::QOI},
 #endif
     {"image/*", ImageFormat::AUTO}};
 
