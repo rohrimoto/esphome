@@ -178,7 +178,7 @@ class UARTComponent {
    *
    * This will load the current UART interface with the latest settings (baud_rate, parity, etc).
    */
-  virtual void load_settings(bool dump_config){};
+  virtual void load_settings(bool dump_config) = 0;
 
   /**
    * Load the UART settings.
@@ -190,7 +190,7 @@ class UARTComponent {
    *
    * This will load the current UART interface with the latest settings (baud_rate, parity, etc).
    */
-  virtual void load_settings(){};
+  void load_settings() { this->load_settings(true); }
 #endif  // USE_ESP8266 || USE_ESP32
 
 #ifdef USE_UART_DEBUGGER
@@ -214,7 +214,7 @@ class UARTComponent {
   uint8_t data_bits_{0};
   UARTParityOptions parity_{UART_CONFIG_PARITY_NONE};
 #ifdef USE_UART_DEBUGGER
-  CallbackManager<void(UARTDirection, uint8_t)> debug_callback_{};
+  CallbackManager<void(UARTDirection, uint8_t, StringRef)> debug_callback_{};
 #endif
 };
 
