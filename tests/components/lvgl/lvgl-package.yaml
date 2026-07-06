@@ -38,11 +38,18 @@ binary_sensor:
                   auto y = x; // block inlining of one line return
                   return y;
 
+text_sensor:
+  - platform: template
+    id: text_sensor_id
+    on_value:
+      - lvgl.label.update:
+          id: hello_label
+          text:
+            argument: x
   - platform: lvgl
     id: button_presser
     name: Button pressed
     widget: button_button
-    state: pressed
 
 lvgl:
   id: lvgl_id
@@ -1050,7 +1057,8 @@ lvgl:
               then:
                 - lvgl.bar.update:
                     id: bar_id
-                    value: !lambda return (int)((float)rand() / RAND_MAX * 100);
+                    value:
+                      entity_state: random_sensor
                     start_value: !lambda return (int)((float)rand() / RAND_MAX * 100);
                     mode: range
                 - logger.log:
@@ -1465,6 +1473,10 @@ color:
     white_int: 255
 
 sensor:
+  - platform: template
+    id: random_sensor
+    lambda: return random_uint32() % 100;
+
   - platform: lvgl
     widget: lv_arc_1
     id: lvgl_arc1_sensor_on_change
