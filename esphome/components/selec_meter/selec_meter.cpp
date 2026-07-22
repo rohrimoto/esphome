@@ -174,15 +174,18 @@ void SelecMeter::decode_em4m_(const std::vector<uint8_t> &data) {
     this->power_factor_sensor_->publish_state(get_float(EM4M_POWER_FACTOR * 2, NO_DEC_UNIT));
   if (this->frequency_sensor_ != nullptr)
     this->frequency_sensor_->publish_state(get_float(EM4M_FREQUENCY * 2, NO_DEC_UNIT));
-  if (this->maximum_demand_active_power_sensor_ != nullptr)
+  if (this->maximum_demand_active_power_sensor_ != nullptr) {
     this->maximum_demand_active_power_sensor_->publish_state(
         get_float(EM4M_MAXIMUM_DEMAND_ACTIVE_POWER * 2, MULTIPLY_THOUSAND_UNIT));
-  if (this->maximum_demand_reactive_power_sensor_ != nullptr)
+  }
+  if (this->maximum_demand_reactive_power_sensor_ != nullptr) {
     this->maximum_demand_reactive_power_sensor_->publish_state(
         get_float(EM4M_MAXIMUM_DEMAND_REACTIVE_POWER * 2, MULTIPLY_THOUSAND_UNIT));
-  if (this->maximum_demand_apparent_power_sensor_ != nullptr)
+  }
+  if (this->maximum_demand_apparent_power_sensor_ != nullptr) {
     this->maximum_demand_apparent_power_sensor_->publish_state(
         get_float(EM4M_MAXIMUM_DEMAND_APPARENT_POWER * 2, MULTIPLY_THOUSAND_UNIT));
+  }
   if (this->import_active_energy_sensor_ != nullptr)
     this->import_active_energy_sensor_->publish_state(get_float(EM4M_IMPORT_ACTIVE_ENERGY * 2, NO_DEC_UNIT));
   if (this->export_active_energy_sensor_ != nullptr)
