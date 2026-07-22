@@ -2,6 +2,8 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/modbus/modbus.h"
 
 #include <vector>
@@ -14,6 +16,20 @@ namespace esphome::selec_meter {
 \
  public: \
   void set_##name##_sensor(sensor::Sensor *(name)) { this->name##_sensor_ = name; }
+
+enum Model : uint8_t {
+  EM2M,
+  EM4M,
+};
+
+// Cycles the extra Modbus reads (serial number, DG sensing) that live far outside the
+// main 0-113 register block and therefore need their own transaction each update.
+enum class ReadState : uint8_t {
+  MAIN_BLOCK,
+  SERIAL_NUMBER,
+  DG_SENSING,
+  IDLE,
+};
 
 class SelecMeter final : public PollingComponent, public modbus::ModbusClientDevice {
  public:
@@ -35,11 +51,81 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   SELEC_METER_SENSOR(maximum_demand_reactive_power)
   SELEC_METER_SENSOR(maximum_demand_apparent_power)
 
+  // EM4M per-phase sensors
+  SELEC_METER_SENSOR(voltage_l1)
+  SELEC_METER_SENSOR(voltage_l2)
+  SELEC_METER_SENSOR(voltage_l3)
+  SELEC_METER_SENSOR(voltage_l12)
+  SELEC_METER_SENSOR(voltage_l23)
+  SELEC_METER_SENSOR(voltage_l31)
+  SELEC_METER_SENSOR(current_l1)
+  SELEC_METER_SENSOR(current_l2)
+  SELEC_METER_SENSOR(current_l3)
+  SELEC_METER_SENSOR(active_power_l1)
+  SELEC_METER_SENSOR(active_power_l2)
+  SELEC_METER_SENSOR(active_power_l3)
+  SELEC_METER_SENSOR(reactive_power_l1)
+  SELEC_METER_SENSOR(reactive_power_l2)
+  SELEC_METER_SENSOR(reactive_power_l3)
+  SELEC_METER_SENSOR(apparent_power_l1)
+  SELEC_METER_SENSOR(apparent_power_l2)
+  SELEC_METER_SENSOR(apparent_power_l3)
+  SELEC_METER_SENSOR(power_factor_l1)
+  SELEC_METER_SENSOR(power_factor_l2)
+  SELEC_METER_SENSOR(power_factor_l3)
+  SELEC_METER_SENSOR(import_active_energy_l1)
+  SELEC_METER_SENSOR(import_active_energy_l2)
+  SELEC_METER_SENSOR(import_active_energy_l3)
+  SELEC_METER_SENSOR(export_active_energy_l1)
+  SELEC_METER_SENSOR(export_active_energy_l2)
+  SELEC_METER_SENSOR(export_active_energy_l3)
+  SELEC_METER_SENSOR(import_reactive_energy_l1)
+  SELEC_METER_SENSOR(import_reactive_energy_l2)
+  SELEC_METER_SENSOR(import_reactive_energy_l3)
+  SELEC_METER_SENSOR(export_reactive_energy_l1)
+  SELEC_METER_SENSOR(export_reactive_energy_l2)
+  SELEC_METER_SENSOR(export_reactive_energy_l3)
+  SELEC_METER_SENSOR(apparent_energy_l1)
+  SELEC_METER_SENSOR(apparent_energy_l2)
+  SELEC_METER_SENSOR(apparent_energy_l3)
+  SELEC_METER_SENSOR(average_voltage_ll)
+  SELEC_METER_SENSOR(net_active_energy_mains)
+  SELEC_METER_SENSOR(net_reactive_energy_mains)
+  SELEC_METER_SENSOR(net_apparent_energy_mains)
+  SELEC_METER_SENSOR(net_active_energy_dg)
+  SELEC_METER_SENSOR(net_reactive_energy_dg)
+  SELEC_METER_SENSOR(net_apparent_energy_dg)
+
+  void set_model(Model model) { this->model_ = model; }
+  // true: registers are word-swapped (LSRF / Mid Little Endian, CDAB byte order)
+  // false: registers are in the meter's straightforward order (MSRF / Big Endian, ABCD byte order)
+  void set_word_swap(bool word_swap) { this->word_swap_ = word_swap; }
+  void set_serial_number_sensor(text_sensor::TextSensor *serial_number) { this->serial_number_sensor_ = serial_number; }
+  void set_dg_sensing_sensor(binary_sensor::BinarySensor *dg_sensing) { this->dg_sensing_sensor_ = dg_sensing; }
+
   void update() override;
+  void loop() override;
 
   void on_modbus_data(const std::vector<uint8_t> &data) override;
+  void on_modbus_error(uint8_t function_code, uint8_t exception_code) override;
+  bool on_modbus_no_response() override;
 
   void dump_config() override;
+
+ protected:
+  void decode_em2m_(const std::vector<uint8_t> &data);
+  void decode_em4m_(const std::vector<uint8_t> &data);
+  void decode_serial_number_(const std::vector<uint8_t> &data);
+  void decode_dg_sensing_(const std::vector<uint8_t> &data);
+  ReadState next_read_state_after_main_block_();
+
+  Model model_{Model::EM2M};
+  bool word_swap_{false};
+  ReadState read_state_{ReadState::IDLE};
+  bool waiting_for_response_{false};
+
+  text_sensor::TextSensor *serial_number_sensor_{nullptr};
+  binary_sensor::BinarySensor *dg_sensing_sensor_{nullptr};
 };
 
 }  // namespace esphome::selec_meter
