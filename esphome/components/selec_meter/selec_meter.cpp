@@ -13,7 +13,7 @@ static const char *const TAG = "selec_meter";
 static const uint8_t MODBUS_CMD_READ_IN_REGISTERS = 0x04;
 static const uint8_t EM2M_REGISTER_COUNT = 34;  // 34 x 16-bit registers
 
-static float decode_float(const std::vector<uint8_t> &data, size_t i, float unit, bool word_swapped) {
+static float decode_float(std::span<const uint8_t> data, size_t i, float unit, bool word_swapped) {
   uint32_t temp = word_swapped ? encode_uint32(data[i + 2], data[i + 3], data[i], data[i + 1])
                                : encode_uint32(data[i], data[i + 1], data[i + 2], data[i + 3]);
 
@@ -30,8 +30,9 @@ ReadState SelecMeter::next_read_state_after_main_block_() {
   return ReadState::IDLE;
 }
 
-void SelecMeter::on_modbus_data(const std::vector<uint8_t> &data) {
+void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) {
   this->waiting_for_response_ = false;
+  auto data = modbus::helpers::server_pdu_payload(response_pdu);
   switch (this->read_state_) {
     case ReadState::MAIN_BLOCK:
       if (this->model_ == Model::EM4M) {
@@ -54,20 +55,20 @@ void SelecMeter::on_modbus_data(const std::vector<uint8_t> &data) {
   }
 }
 
-void SelecMeter::on_modbus_error(uint8_t function_code, uint8_t exception_code) {
-  ESP_LOGW(TAG, "Modbus error: function 0x%02X, exception 0x%02X", function_code, exception_code);
+void SelecMeter::on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) {
+  ESP_LOGW(TAG, "Modbus error: exception 0x%02X", static_cast<uint8_t>(exception_code));
   this->waiting_for_response_ = false;
   this->read_state_ = ReadState::IDLE;
 }
 
-bool SelecMeter::on_modbus_no_response() {
+bool SelecMeter::on_no_response() {
   ESP_LOGW(TAG, "No Modbus response");
   this->waiting_for_response_ = false;
   this->read_state_ = ReadState::IDLE;
   return false;
 }
 
-void SelecMeter::decode_serial_number_(const std::vector<uint8_t> &data) {
+void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
   if (data.size() < 4 || this->serial_number_sensor_ == nullptr)
     return;
   uint32_t serial = this->word_swap_ ? encode_uint32(data[2], data[3], data[0], data[1])
@@ -77,14 +78,14 @@ void SelecMeter::decode_serial_number_(const std::vector<uint8_t> &data) {
   this->serial_number_sensor_->publish_state(buf);
 }
 
-void SelecMeter::decode_dg_sensing_(const std::vector<uint8_t> &data) {
+void SelecMeter::decode_dg_sensing_(std::span<const uint8_t> data) {
   if (data.size() < 4 || this->dg_sensing_sensor_ == nullptr)
     return;
   float value = decode_float(data, 0, NO_DEC_UNIT, this->word_swap_);
   this->dg_sensing_sensor_->publish_state(value != 0);
 }
 
-void SelecMeter::decode_em2m_(const std::vector<uint8_t> &data) {
+void SelecMeter::decode_em2m_(std::span<const uint8_t> data) {
   if (data.size() < EM2M_REGISTER_COUNT * 2) {
     ESP_LOGW(TAG, "Invalid size for SelecMeter!");
     return;
@@ -151,7 +152,7 @@ void SelecMeter::decode_em2m_(const std::vector<uint8_t> &data) {
     this->maximum_demand_apparent_power_sensor_->publish_state(maximum_demand_apparent_power);
 }
 
-void SelecMeter::decode_em4m_(const std::vector<uint8_t> &data) {
+void SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
   if (data.size() < EM4M_REGISTER_COUNT * 2) {
     ESP_LOGW(TAG, "Invalid size for SelecMeter!");
     return;

@@ -6,7 +6,7 @@
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/modbus/modbus.h"
 
-#include <vector>
+#include <span>
 
 namespace esphome::selec_meter {
 
@@ -106,17 +106,17 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   void update() override;
   void loop() override;
 
-  void on_modbus_data(const std::vector<uint8_t> &data) override;
-  void on_modbus_error(uint8_t function_code, uint8_t exception_code) override;
-  bool on_modbus_no_response() override;
+  void on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) override;
+  void on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) override;
+  bool on_no_response() override;
 
   void dump_config() override;
 
  protected:
-  void decode_em2m_(const std::vector<uint8_t> &data);
-  void decode_em4m_(const std::vector<uint8_t> &data);
-  void decode_serial_number_(const std::vector<uint8_t> &data);
-  void decode_dg_sensing_(const std::vector<uint8_t> &data);
+  void decode_em2m_(std::span<const uint8_t> data);
+  void decode_em4m_(std::span<const uint8_t> data);
+  void decode_serial_number_(std::span<const uint8_t> data);
+  void decode_dg_sensing_(std::span<const uint8_t> data);
   ReadState next_read_state_after_main_block_();
 
   Model model_{Model::EM2M};
