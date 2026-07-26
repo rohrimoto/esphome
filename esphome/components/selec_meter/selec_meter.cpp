@@ -10,7 +10,6 @@ namespace esphome::selec_meter {
 
 static const char *const TAG = "selec_meter";
 
-static const uint8_t MODBUS_CMD_READ_IN_REGISTERS = 0x04;
 static const uint8_t EM2M_REGISTER_COUNT = 34;  // 34 x 16-bit registers
 
 static float decode_float(std::span<const uint8_t> data, size_t i, float unit, bool word_swapped) {
@@ -298,14 +297,14 @@ void SelecMeter::loop() {
   switch (this->read_state_) {
     case ReadState::MAIN_BLOCK: {
       uint8_t register_count = this->model_ == Model::EM4M ? EM4M_REGISTER_COUNT : EM2M_REGISTER_COUNT;
-      this->send(MODBUS_CMD_READ_IN_REGISTERS, 0, register_count);
+      this->read_input_registers(0, register_count);
       break;
     }
     case ReadState::SERIAL_NUMBER:
-      this->send(MODBUS_CMD_READ_IN_REGISTERS, EM4M_SERIAL_NUMBER, 2);
+      this->read_input_registers(EM4M_SERIAL_NUMBER, 2);
       break;
     case ReadState::DG_SENSING:
-      this->send(MODBUS_CMD_READ_IN_REGISTERS, EM4M_DG_SENSING, 2);
+      this->read_input_registers(EM4M_DG_SENSING, 2);
       break;
     case ReadState::IDLE:
       return;
