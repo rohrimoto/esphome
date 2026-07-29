@@ -108,7 +108,7 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
 
   void on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) override;
   void on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) override;
-  bool on_no_response() override;
+  bool on_no_response(std::span<const uint8_t> request_pdu) override;
 
   void dump_config() override;
 

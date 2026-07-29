@@ -60,7 +60,7 @@ void SelecMeter::on_error(std::span<const uint8_t> request_pdu, modbus::Exceptio
   this->read_state_ = ReadState::IDLE;
 }
 
-bool SelecMeter::on_no_response() {
+bool SelecMeter::on_no_response(std::span<const uint8_t> request_pdu) {
   ESP_LOGW(TAG, "No Modbus response");
   this->waiting_for_response_ = false;
   this->read_state_ = ReadState::IDLE;
