@@ -53,6 +53,7 @@ def AUTO_LOAD(config: ConfigType) -> list[str]:
         extra.append("binary_sensor")
     return base + extra
 
+
 CONF_TOTAL_ACTIVE_ENERGY = "total_active_energy"
 CONF_TOTAL_REACTIVE_ENERGY = "total_reactive_energy"
 CONF_APPARENT_ENERGY = "apparent_energy"
