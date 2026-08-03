@@ -1,5 +1,6 @@
 import esphome.codegen as cg
 from esphome.components import binary_sensor, modbus, sensor, text_sensor
+from esphome.components.const import CONF_BYTE_ORDER
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ACTIVE_POWER,
@@ -121,7 +122,6 @@ MODELS = {
     MODEL_EM4M: SelecMeterModel.EM4M,
 }
 
-CONF_BYTE_ORDER = "byte_order"
 # Naming matches the meter's own register 40070 (Endianness Selection):
 # MSRF = Big Endian (straightforward ABCD word order), LSRF = Mid Little Endian (word-swapped CDAB order).
 BYTE_ORDER_MSRF = "msrf"
@@ -510,13 +510,14 @@ def _validate_model_sensors(config: ConfigType) -> ConfigType:
     if model == MODEL_EM2M:
         for key in (*EM4M_SENSORS, *EM4M_ONLY_EXTRA_KEYS):
             if key in config:
-                raise cv.Invalid(f"'{key}' requires 'model: {MODEL_EM4M}'")
+                raise cv.Invalid(f"'{key}' requires 'model: {MODEL_EM4M}'", [key])
     elif model == MODEL_EM4M:
         for key in EM2M_ONLY_SENSORS:
             if key in config:
                 raise cv.Invalid(
                     f"'{key}' has no non-DG equivalent register on the EM4M "
-                    f"and is not yet supported with 'model: {MODEL_EM4M}'"
+                    f"and is not yet supported with 'model: {MODEL_EM4M}'",
+                    [key],
                 )
     return config
 

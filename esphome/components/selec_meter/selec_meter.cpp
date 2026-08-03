@@ -309,7 +309,7 @@ void SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
 }
 
 void SelecMeter::update() {
-  if (this->waiting_for_response_)
+  if (this->waiting_for_response_ || this->read_state_ != ReadState::IDLE)
     return;
   this->read_state_ = ReadState::MAIN_BLOCK;
 }
@@ -318,24 +318,31 @@ void SelecMeter::loop() {
   if (this->waiting_for_response_ || this->read_state_ == ReadState::IDLE)
     return;
 
-  // Set before sending: read_input_registers() can synchronously invoke on_not_sent(), which must be
-  // able to clear this flag again rather than have it re-latched by an assignment after the call returns.
   this->waiting_for_response_ = true;
 
+  bool sent = false;
   switch (this->read_state_) {
     case ReadState::MAIN_BLOCK: {
       uint8_t register_count = this->model_ == Model::EM4M ? EM4M_REGISTER_COUNT : EM2M_REGISTER_COUNT;
-      this->read_input_registers(0, register_count);
+      sent = this->read_input_registers(0, register_count);
       break;
     }
     case ReadState::SERIAL_NUMBER:
-      this->read_input_registers(EM4M_SERIAL_NUMBER, 2);
+      sent = this->read_input_registers(EM4M_SERIAL_NUMBER, 2);
       break;
     case ReadState::DG_SENSING:
-      this->read_input_registers(EM4M_DG_SENSING, 2);
+      sent = this->read_input_registers(EM4M_DG_SENSING, 2);
       break;
     case ReadState::IDLE:
       return;
+  }
+
+  // A false return means the request was refused at send_pdu() (e.g. tx buffer full) and no terminal
+  // callback will ever follow -- clear the flag ourselves or waiting_for_response_ latches forever.
+  if (!sent) {
+    ESP_LOGW(TAG, "Modbus request refused");
+    this->waiting_for_response_ = false;
+    this->read_state_ = ReadState::IDLE;
   }
 }
 
