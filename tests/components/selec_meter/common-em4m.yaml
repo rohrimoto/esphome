@@ -105,3 +105,7 @@ sensor:
     maximum_demand_apparent_power:
       name: SelecEM4M Maximum Demand Apparent Power
       disabled_by_default: true
+    serial_number:
+      name: SelecEM4M Serial Number
+    dg_sensing:
+      name: SelecEM4M DG Sensing

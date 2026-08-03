@@ -35,11 +35,22 @@ from esphome.const import (
 )
 from esphome.types import ConfigType
 
-AUTO_LOAD = ["modbus", "text_sensor", "binary_sensor"]
 CODEOWNERS = ["@sourabhjaiswal"]
 
 CONF_SERIAL_NUMBER = "serial_number"
 CONF_DG_SENSING = "dg_sensing"
+
+
+def AUTO_LOAD(config: ConfigType) -> list[str]:
+    base = ["modbus"]
+    if not config:
+        return base + ["text_sensor", "binary_sensor"]
+    extra = []
+    if CONF_SERIAL_NUMBER in config:
+        extra.append("text_sensor")
+    if CONF_DG_SENSING in config:
+        extra.append("binary_sensor")
+    return base + extra
 
 CONF_TOTAL_ACTIVE_ENERGY = "total_active_energy"
 CONF_TOTAL_REACTIVE_ENERGY = "total_reactive_energy"

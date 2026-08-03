@@ -5,6 +5,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 
 namespace esphome::selec_meter {
 
@@ -22,10 +23,14 @@ static float decode_float(std::span<const uint8_t> data, size_t i, float unit, b
 }
 
 ReadState SelecMeter::next_read_state_after_main_block_() {
-  if (this->serial_number_sensor_ != nullptr)
+#ifdef USE_TEXT_SENSOR
+  if (this->serial_number_sensor_ != nullptr && !this->serial_number_published_)
     return ReadState::SERIAL_NUMBER;
+#endif
+#ifdef USE_BINARY_SENSOR
   if (this->dg_sensing_sensor_ != nullptr)
     return ReadState::DG_SENSING;
+#endif
   return ReadState::IDLE;
 }
 
@@ -42,11 +47,19 @@ void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<con
       this->read_state_ = this->next_read_state_after_main_block_();
       break;
     case ReadState::SERIAL_NUMBER:
+#ifdef USE_TEXT_SENSOR
       this->decode_serial_number_(data);
+#endif
+#ifdef USE_BINARY_SENSOR
       this->read_state_ = this->dg_sensing_sensor_ != nullptr ? ReadState::DG_SENSING : ReadState::IDLE;
+#else
+      this->read_state_ = ReadState::IDLE;
+#endif
       break;
     case ReadState::DG_SENSING:
+#ifdef USE_BINARY_SENSOR
       this->decode_dg_sensing_(data);
+#endif
       this->read_state_ = ReadState::IDLE;
       break;
     case ReadState::IDLE:
@@ -67,6 +80,13 @@ bool SelecMeter::on_no_response(std::span<const uint8_t> request_pdu) {
   return false;
 }
 
+void SelecMeter::on_not_sent(std::span<const uint8_t> request_pdu) {
+  ESP_LOGW(TAG, "Modbus request not sent");
+  this->waiting_for_response_ = false;
+  this->read_state_ = ReadState::IDLE;
+}
+
+#ifdef USE_TEXT_SENSOR
 void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
   if (data.size() < 4 || this->serial_number_sensor_ == nullptr)
     return;
@@ -75,14 +95,18 @@ void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
   char buf[9];
   snprintf(buf, sizeof(buf), "%08" PRIX32, serial);
   this->serial_number_sensor_->publish_state(buf);
+  this->serial_number_published_ = true;
 }
+#endif
 
+#ifdef USE_BINARY_SENSOR
 void SelecMeter::decode_dg_sensing_(std::span<const uint8_t> data) {
   if (data.size() < 4 || this->dg_sensing_sensor_ == nullptr)
     return;
   float value = decode_float(data, 0, NO_DEC_UNIT, this->word_swap_);
   this->dg_sensing_sensor_->publish_state(value != 0);
 }
+#endif
 
 void SelecMeter::decode_em2m_(std::span<const uint8_t> data) {
   if (data.size() < EM2M_REGISTER_COUNT * 2) {
@@ -294,6 +318,10 @@ void SelecMeter::loop() {
   if (this->waiting_for_response_ || this->read_state_ == ReadState::IDLE)
     return;
 
+  // Set before sending: read_input_registers() can synchronously invoke on_not_sent(), which must be
+  // able to clear this flag again rather than have it re-latched by an assignment after the call returns.
+  this->waiting_for_response_ = true;
+
   switch (this->read_state_) {
     case ReadState::MAIN_BLOCK: {
       uint8_t register_count = this->model_ == Model::EM4M ? EM4M_REGISTER_COUNT : EM2M_REGISTER_COUNT;
@@ -309,7 +337,6 @@ void SelecMeter::loop() {
     case ReadState::IDLE:
       return;
   }
-  this->waiting_for_response_ = true;
 }
 
 void SelecMeter::dump_config() {
@@ -380,8 +407,12 @@ void SelecMeter::dump_config() {
   LOG_SENSOR("  ", "Net Active Energy (DG)", this->net_active_energy_dg_sensor_);
   LOG_SENSOR("  ", "Net Reactive Energy (DG)", this->net_reactive_energy_dg_sensor_);
   LOG_SENSOR("  ", "Net Apparent Energy (DG)", this->net_apparent_energy_dg_sensor_);
+#ifdef USE_TEXT_SENSOR
   LOG_TEXT_SENSOR("  ", "Serial Number", this->serial_number_sensor_);
+#endif
+#ifdef USE_BINARY_SENSOR
   LOG_BINARY_SENSOR("  ", "DG Sensing", this->dg_sensing_sensor_);
+#endif
 }
 
 }  // namespace esphome::selec_meter

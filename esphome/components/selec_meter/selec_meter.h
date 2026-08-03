@@ -2,9 +2,13 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
-#include "esphome/components/binary_sensor/binary_sensor.h"
-#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/modbus/modbus.h"
+#ifdef USE_BINARY_SENSOR
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#endif
+#ifdef USE_TEXT_SENSOR
+#include "esphome/components/text_sensor/text_sensor.h"
+#endif
 
 #include <span>
 
@@ -100,8 +104,12 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   // true: registers are word-swapped (LSRF / Mid Little Endian, CDAB byte order)
   // false: registers are in the meter's straightforward order (MSRF / Big Endian, ABCD byte order)
   void set_word_swap(bool word_swap) { this->word_swap_ = word_swap; }
+#ifdef USE_TEXT_SENSOR
   void set_serial_number_sensor(text_sensor::TextSensor *serial_number) { this->serial_number_sensor_ = serial_number; }
+#endif
+#ifdef USE_BINARY_SENSOR
   void set_dg_sensing_sensor(binary_sensor::BinarySensor *dg_sensing) { this->dg_sensing_sensor_ = dg_sensing; }
+#endif
 
   void update() override;
   void loop() override;
@@ -109,14 +117,19 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   void on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) override;
   void on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) override;
   bool on_no_response(std::span<const uint8_t> request_pdu) override;
+  void on_not_sent(std::span<const uint8_t> request_pdu) override;
 
   void dump_config() override;
 
  protected:
   void decode_em2m_(std::span<const uint8_t> data);
   void decode_em4m_(std::span<const uint8_t> data);
+#ifdef USE_TEXT_SENSOR
   void decode_serial_number_(std::span<const uint8_t> data);
+#endif
+#ifdef USE_BINARY_SENSOR
   void decode_dg_sensing_(std::span<const uint8_t> data);
+#endif
   ReadState next_read_state_after_main_block_();
 
   Model model_{Model::EM2M};
@@ -124,8 +137,13 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   ReadState read_state_{ReadState::IDLE};
   bool waiting_for_response_{false};
 
+#ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *serial_number_sensor_{nullptr};
+  bool serial_number_published_{false};
+#endif
+#ifdef USE_BINARY_SENSOR
   binary_sensor::BinarySensor *dg_sensing_sensor_{nullptr};
+#endif
 };
 
 }  // namespace esphome::selec_meter
