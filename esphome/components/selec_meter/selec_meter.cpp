@@ -88,8 +88,12 @@ void SelecMeter::on_not_sent(std::span<const uint8_t> request_pdu) {
 
 #ifdef USE_TEXT_SENSOR
 void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
-  if (data.size() < 4 || this->serial_number_sensor_ == nullptr)
+  if (this->serial_number_sensor_ == nullptr)
     return;
+  if (data.size() < 4) {
+    ESP_LOGW(TAG, "Short response for serial number: %zu bytes", data.size());
+    return;
+  }
   uint32_t serial = this->word_swap_ ? encode_uint32(data[2], data[3], data[0], data[1])
                                      : encode_uint32(data[0], data[1], data[2], data[3]);
   char buf[9];
@@ -101,8 +105,12 @@ void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
 
 #ifdef USE_BINARY_SENSOR
 void SelecMeter::decode_dg_sensing_(std::span<const uint8_t> data) {
-  if (data.size() < 4 || this->dg_sensing_sensor_ == nullptr)
+  if (this->dg_sensing_sensor_ == nullptr)
     return;
+  if (data.size() < 4) {
+    ESP_LOGW(TAG, "Short response for DG sensing: %zu bytes", data.size());
+    return;
+  }
   float value = decode_float(data, 0, NO_DEC_UNIT, this->word_swap_);
   this->dg_sensing_sensor_->publish_state(value != 0);
 }
@@ -334,7 +342,7 @@ void SelecMeter::loop() {
       sent = this->read_input_registers(EM4M_DG_SENSING, 2);
       break;
     case ReadState::IDLE:
-      return;
+      break;
   }
 
   // A false return means the request was refused at send_pdu() (e.g. tx buffer full) and no terminal
