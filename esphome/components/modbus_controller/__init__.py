@@ -9,7 +9,14 @@ from esphome.components.modbus.helpers import (
     EntityType,
 )
 import esphome.config_validation as cv
-from esphome.const import CONF_ADDRESS, CONF_ID, CONF_LAMBDA, CONF_NAME, CONF_OFFSET
+from esphome.const import (
+    CONF_ADDRESS,
+    CONF_CONTINUOUS,
+    CONF_ID,
+    CONF_LAMBDA,
+    CONF_NAME,
+    CONF_OFFSET,
+)
 from esphome.cpp_helpers import logging
 from esphome.types import ConfigType
 
@@ -19,6 +26,7 @@ from .const import (
     CONF_BYTE_OFFSET,
     CONF_COMMAND_THROTTLE,
     CONF_CUSTOM_COMMAND,
+    CONF_CUSTOM_PDU,
     CONF_FORCE_NEW_RANGE,
     CONF_MAX_CMD_RETRIES,
     CONF_MODBUS_CONTROLLER_ID,
@@ -29,6 +37,7 @@ from .const import (
     CONF_REGISTER_COUNT,
     CONF_REGISTER_TYPE,
     CONF_RESPONSE_SIZE,
+    CONF_REUSE_PREVIOUS_RANGE,
     CONF_SERVER_COURTESY_RESPONSE,
     CONF_SERVER_REGISTERS,
     CONF_SKIP_UPDATES,
@@ -42,27 +51,53 @@ AUTO_LOAD = ["modbus"]
 MULTI_CONF = True
 
 modbus_controller_ns = cg.esphome_ns.namespace("modbus_controller")
-ModbusController = modbus_controller_ns.class_(
-    "ModbusController", cg.PollingComponent, modbus.ModbusClientDevice
-)
+ModbusController = modbus_controller_ns.class_("ModbusController", cg.PollingComponent)
 
 SensorItem = modbus_controller_ns.struct("SensorItem")
 
+# Heap-free buffers that platform write lambdas fill (byte PDUs / register words). Aliases for
+# StaticVector<...> declared in modbus_controller.h; used as the write-lambda payload parameter type.
+ModbusWriteBytes = modbus_controller_ns.class_("ModbusWriteBytes")
+ModbusWriteRegisters = modbus_controller_ns.class_("ModbusWriteRegisters")
+
+RangeReuse = modbus_controller_ns.enum("RangeReuse", is_class=True)
+RANGE_REUSE = {
+    "auto": RangeReuse.AUTO,
+    True: RangeReuse.ALWAYS,
+    False: RangeReuse.NEVER,
+}
+
 _LOGGER = logging.getLogger(__name__)
+
+
+# Remove before 2027.2.0
+def _deprecated_skip_updates(value):
+    value = cv.positive_int(value)
+    if value != 0:
+        _LOGGER.warning(
+            "[modbus_controller] 'skip_updates' is deprecated and will be removed in 2027.2.0. "
+            "Instead, add a second modbus_controller with the same address and a slower "
+            "update_interval, and attach the slow sensors to it."
+        )
+    return value
+
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(ModbusController),
-            cv.Optional(CONF_ALLOW_DUPLICATE_COMMANDS, default=False): cv.boolean,
-            cv.Optional(
-                CONF_COMMAND_THROTTLE, default="0ms"
-            ): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_ALLOW_DUPLICATE_COMMANDS): cv.invalid(
+                "This option has been removed. Polling commands are deduplicated by the modbus hub; one-shot commands (writes) are always transmitted."
+            ),
+            cv.Optional(CONF_COMMAND_THROTTLE): cv.invalid(
+                "This option has been removed. Use 'turnaround_time' on the 'modbus' component instead."
+            ),
             cv.Optional(CONF_SERVER_COURTESY_RESPONSE): cv.invalid(
                 "This option has been removed. Use modbus_server component instead: https://esphome.io/components/modbus_server/"
             ),
             cv.Optional(CONF_MAX_CMD_RETRIES, default=4): cv.positive_int,
             cv.Optional(CONF_OFFLINE_SKIP_UPDATES, default=0): cv.positive_int,
+            cv.Optional(CONF_CONTINUOUS, default=False): cv.boolean,
             cv.Optional(
                 CONF_SERVER_REGISTERS,
             ): cv.invalid(
@@ -81,7 +116,13 @@ ModbusItemBaseSchema = cv.Schema(
     {
         cv.GenerateID(CONF_MODBUS_CONTROLLER_ID): cv.use_id(ModbusController),
         cv.Optional(CONF_ADDRESS): cv.positive_int,
-        cv.Optional(CONF_CUSTOM_COMMAND): cv.ensure_list(cv.hex_uint8_t),
+        cv.Optional(CONF_CUSTOM_PDU): cv.ensure_list(cv.hex_uint8_t),
+        cv.Optional(CONF_CUSTOM_COMMAND): cv.invalid(
+            "'custom_command' has been renamed to 'custom_pdu' and no longer takes a leading device "
+            "address byte. Provide the PDU only (function code + data); the configured device address "
+            "and the CRC are added automatically. See "
+            "https://esphome.io/components/modbus_controller/"
+        ),
         cv.Exclusive(
             CONF_OFFSET,
             "offset",
@@ -93,27 +134,78 @@ ModbusItemBaseSchema = cv.Schema(
             f"{CONF_OFFSET} and {CONF_BYTE_OFFSET} can't be used together",
         ): cv.positive_int,
         cv.Optional(CONF_BITMASK, default=0xFFFFFFFF): cv.hex_uint32_t,
-        cv.Optional(CONF_SKIP_UPDATES, default=0): cv.positive_int,
-        cv.Optional(CONF_FORCE_NEW_RANGE, default=False): cv.boolean,
+        cv.Optional(CONF_SKIP_UPDATES, default=0): _deprecated_skip_updates,
+        cv.Optional(CONF_REUSE_PREVIOUS_RANGE, default="auto"): cv.Any(
+            cv.boolean, cv.one_of("auto", lower=True)
+        ),
+        # Deprecated options, migrated by validate_range_reuse_migration(). Remove before 2027.2.0
+        cv.Optional(CONF_FORCE_NEW_RANGE): cv.boolean,
+        cv.Optional(CONF_REGISTER_COUNT): cv.positive_int,
         cv.Optional(CONF_LAMBDA): cv.returning_lambda,
         cv.Optional(CONF_RESPONSE_SIZE, default=0): cv.positive_int,
     },
 )
 
 
-def validate_modbus_register(config):
-    if CONF_CUSTOM_COMMAND not in config and CONF_ADDRESS not in config:
-        raise cv.Invalid(
-            f" {CONF_ADDRESS} is a required property if '{CONF_CUSTOM_COMMAND}:' isn't used"
+def _derived_register_widths(config) -> set[int]:
+    """Register widths an item derives on its own; a matching register_count is redundant."""
+    response_size = config.get(CONF_RESPONSE_SIZE, 0)
+    if (value_type := config.get(CONF_VALUE_TYPE)) is not None:
+        widths = {TYPE_REGISTER_MAP[value_type]}
+        if value_type == "RAW" and response_size > 0:
+            widths.add((response_size + 1) // 2)
+        return widths
+    if response_size > 0:
+        # text sensors: the old default was floor(response_size / 2); the derived width is now ceil
+        return {response_size // 2, (response_size + 1) // 2}
+    return {1}
+
+
+# Remove before 2027.2.0
+def validate_range_reuse_migration(config):
+    """Migrate the removed force_new_range/register_count options to reuse_previous_range."""
+    if (force_new_range := config.pop(CONF_FORCE_NEW_RANGE, None)) is not None:
+        _LOGGER.warning(
+            "'%s' is deprecated, use '%s: false' instead. Removed in 2027.2.0",
+            CONF_FORCE_NEW_RANGE,
+            CONF_REUSE_PREVIOUS_RANGE,
         )
-    if CONF_CUSTOM_COMMAND in config and CONF_REGISTER_TYPE in config:
+        if force_new_range and config[CONF_REUSE_PREVIOUS_RANGE] == "auto":
+            config[CONF_REUSE_PREVIOUS_RANGE] = False
+    if (register_count := config.pop(CONF_REGISTER_COUNT, None)) is not None:
+        if (
+            register_count not in _derived_register_widths(config)
+            and register_count != 0
+        ):
+            raise cv.Invalid(
+                f"'{CONF_REGISTER_COUNT}' has been removed; the number of registers to read is now "
+                f"derived from '{CONF_VALUE_TYPE}' (or '{CONF_RESPONSE_SIZE}' for RAW values and text "
+                f"sensors). To make one request span extra registers up to the next sensor, set "
+                f"'{CONF_REUSE_PREVIOUS_RANGE}: true' on the NEXT sensor instead; for RAW or text block "
+                f"reads set '{CONF_RESPONSE_SIZE}' to the byte count; to force multi-register writes set "
+                f"'use_write_multiple: true'. See "
+                "https://esphome.io/components/modbus_controller/"
+            )
+        _LOGGER.warning(
+            "'%s' matches the derived register width and is redundant; remove it. Removed in 2027.2.0",
+            CONF_REGISTER_COUNT,
+        )
+    return config
+
+
+def validate_modbus_register(config):
+    if CONF_CUSTOM_PDU not in config and CONF_ADDRESS not in config:
         raise cv.Invalid(
-            f"can't use '{CONF_REGISTER_TYPE}:' together with '{CONF_CUSTOM_COMMAND}:'",
+            f" {CONF_ADDRESS} is a required property if '{CONF_CUSTOM_PDU}:' isn't used"
+        )
+    if CONF_CUSTOM_PDU in config and CONF_REGISTER_TYPE in config:
+        raise cv.Invalid(
+            f"can't use '{CONF_REGISTER_TYPE}:' together with '{CONF_CUSTOM_PDU}:'",
         )
 
-    if CONF_CUSTOM_COMMAND not in config and CONF_REGISTER_TYPE not in config:
+    if CONF_CUSTOM_PDU not in config and CONF_REGISTER_TYPE not in config:
         raise cv.Invalid(
-            f" {CONF_REGISTER_TYPE} is a required property if '{CONF_CUSTOM_COMMAND}:' isn't used"
+            f" {CONF_REGISTER_TYPE} is a required property if '{CONF_CUSTOM_PDU}:' isn't used"
         )
     return config
 
@@ -129,19 +221,12 @@ FINAL_VALIDATE_SCHEMA = _final_validate
 
 def modbus_calc_properties(config):
     byte_offset = 0
-    reg_count = 0
     if CONF_OFFSET in config:
         byte_offset = config[CONF_OFFSET]
     # A CONF_BYTE_OFFSET setting overrides CONF_OFFSET
     if CONF_BYTE_OFFSET in config:
         byte_offset = config[CONF_BYTE_OFFSET]
-    if CONF_REGISTER_COUNT in config:
-        reg_count = config[CONF_REGISTER_COUNT]
-    if CONF_VALUE_TYPE in config:
-        value_type = config[CONF_VALUE_TYPE]
-        if reg_count == 0:
-            reg_count = TYPE_REGISTER_MAP[value_type]
-    if CONF_CUSTOM_COMMAND in config:
+    if CONF_CUSTOM_PDU in config:
         if CONF_ADDRESS not in config:
             # generate a unique modbus address using the hash of the name
             # CONF_NAME set even if only CONF_ID is used.
@@ -151,15 +236,14 @@ def modbus_calc_properties(config):
                 value = value.encode()
             config[CONF_ADDRESS] = binascii.crc_hqx(value, 0)
         config[CONF_REGISTER_TYPE] = cv.enum(MODBUS_REGISTER_TYPE)("custom")
-        config[CONF_FORCE_NEW_RANGE] = True
-    return byte_offset, reg_count
+    return byte_offset
 
 
 async def add_modbus_base_properties(
     var, config, sensor_type, lambda_param_type=cg.float_, lambda_return_type=float
 ):
-    if CONF_CUSTOM_COMMAND in config:
-        cg.add(var.set_custom_data(config[CONF_CUSTOM_COMMAND]))
+    if CONF_CUSTOM_PDU in config:
+        cg.add(var.set_custom_pdu(config[CONF_CUSTOM_PDU]))
 
     if config[CONF_RESPONSE_SIZE] > 0:
         cg.add(var.set_register_size(config[CONF_RESPONSE_SIZE]))
@@ -198,10 +282,9 @@ _CALLBACK_AUTOMATIONS = (
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
-    cg.add(var.set_allow_duplicate_commands(config[CONF_ALLOW_DUPLICATE_COMMANDS]))
-    cg.add(var.set_command_throttle(config[CONF_COMMAND_THROTTLE]))
     cg.add(var.set_max_cmd_retries(config[CONF_MAX_CMD_RETRIES]))
     cg.add(var.set_offline_skip_updates(config[CONF_OFFLINE_SKIP_UPDATES]))
+    cg.add(var.set_continuous(config[CONF_CONTINUOUS]))
     await register_modbus_device(var, config)
     await automation.build_callback_automations(var, config, _CALLBACK_AUTOMATIONS)
 

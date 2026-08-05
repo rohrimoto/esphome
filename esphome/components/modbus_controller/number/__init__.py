@@ -15,18 +15,21 @@ from esphome.const import (
 )
 
 from .. import (
+    RANGE_REUSE,
     ModbusItemBaseSchema,
+    ModbusWriteRegisters,
     SensorItem,
     add_modbus_base_properties,
     modbus_calc_properties,
     modbus_controller_ns,
+    validate_range_reuse_migration,
 )
 from ..const import (
     CONF_BITMASK,
-    CONF_CUSTOM_COMMAND,
-    CONF_FORCE_NEW_RANGE,
+    CONF_CUSTOM_PDU,
     CONF_MODBUS_CONTROLLER_ID,
     CONF_REGISTER_TYPE,
+    CONF_REUSE_PREVIOUS_RANGE,
     CONF_SKIP_UPDATES,
     CONF_USE_WRITE_MULTIPLE,
     CONF_VALUE_TYPE,
@@ -53,9 +56,9 @@ def validate_min_max(config):
 
 
 def validate_modbus_number(config):
-    if CONF_CUSTOM_COMMAND not in config and CONF_ADDRESS not in config:
+    if CONF_CUSTOM_PDU not in config and CONF_ADDRESS not in config:
         raise cv.Invalid(
-            f" {CONF_ADDRESS} is a required property if '{CONF_CUSTOM_COMMAND}:' isn't used"
+            f" {CONF_ADDRESS} is a required property if '{CONF_CUSTOM_PDU}:' isn't used"
         )
     return config
 
@@ -81,11 +84,12 @@ CONFIG_SCHEMA = cv.All(
     ),
     validate_min_max,
     validate_modbus_number,
+    validate_range_reuse_migration,
 )
 
 
 async def to_code(config):
-    byte_offset, reg_count = modbus_calc_properties(config)
+    byte_offset = modbus_calc_properties(config)
     var = cg.new_Pvariable(
         config[CONF_ID],
         config[CONF_REGISTER_TYPE],
@@ -93,9 +97,8 @@ async def to_code(config):
         byte_offset,
         config[CONF_BITMASK],
         config[CONF_VALUE_TYPE],
-        reg_count,
         config[CONF_SKIP_UPDATES],
-        config[CONF_FORCE_NEW_RANGE],
+        RANGE_REUSE[config[CONF_REUSE_PREVIOUS_RANGE]],
     )
 
     await cg.register_component(var, config)
@@ -120,7 +123,7 @@ async def to_code(config):
             [
                 (ModbusNumber.operator("ptr"), "item"),
                 (cg.float_, "x"),
-                (cg.std_vector.template(cg.uint16).operator("ref"), "payload"),
+                (ModbusWriteRegisters.operator("ref"), "payload"),
             ],
             return_type=cg.optional.template(float),
         )

@@ -128,6 +128,31 @@ inline bool value_type_is_float(SensorValueType v) {
   return v == SensorValueType::FP32 || v == SensorValueType::FP32_R;
 }
 
+/// Number of 16-bit registers a value of this type occupies (RAW counts as one register).
+inline uint16_t register_width_for(SensorValueType v) {
+  switch (v) {
+    case SensorValueType::U_DWORD:
+    case SensorValueType::S_DWORD:
+    case SensorValueType::U_DWORD_R:
+    case SensorValueType::S_DWORD_R:
+    case SensorValueType::FP32:
+    case SensorValueType::FP32_R:
+      return 2;
+    case SensorValueType::U_QWORD:
+    case SensorValueType::S_QWORD:
+    case SensorValueType::U_QWORD_R:
+    case SensorValueType::S_QWORD_R:
+      return 4;
+    default:
+      return 1;
+  }
+}
+
+/// Coils and discrete inputs are the bit-addressed entity tables; the other types are 16-bit registers.
+inline bool is_entity_type_binary(EntityType type) {
+  return type == EntityType::COIL || type == EntityType::DISCRETE_INPUT;
+}
+
 inline FunctionCode modbus_register_read_function(EntityType reg_type) {
   switch (reg_type) {
     case EntityType::COIL:
@@ -154,6 +179,27 @@ inline FunctionCode modbus_register_write_function(EntityType reg_type, bool mul
     case EntityType::DISCRETE_INPUT:
     default:
       return FunctionCode::INVALID;
+  }
+}
+
+/// Best-effort mapping from a function code to the entity table it acts on. Returns EntityType::CUSTOM for
+/// custom or unrecognized function codes. Used to attach metadata to custom PDUs for logging/dispatch.
+inline EntityType entity_type_from_function_code(uint8_t function_code) {
+  switch (static_cast<ModbusFunctionCode>(function_code & FUNCTION_CODE_MASK)) {
+    case ModbusFunctionCode::READ_COILS:
+    case ModbusFunctionCode::WRITE_SINGLE_COIL:
+    case ModbusFunctionCode::WRITE_MULTIPLE_COILS:
+      return EntityType::COIL;
+    case ModbusFunctionCode::READ_DISCRETE_INPUTS:
+      return EntityType::DISCRETE_INPUT;
+    case ModbusFunctionCode::READ_HOLDING_REGISTERS:
+    case ModbusFunctionCode::WRITE_SINGLE_REGISTER:
+    case ModbusFunctionCode::WRITE_MULTIPLE_REGISTERS:
+      return EntityType::HOLDING;
+    case ModbusFunctionCode::READ_INPUT_REGISTERS:
+      return EntityType::INPUT_REGISTER;
+    default:
+      return EntityType::CUSTOM;
   }
 }
 
