@@ -4,6 +4,7 @@
 #include "esphome/core/log.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -12,6 +13,20 @@ namespace esphome::selec_meter {
 static const char *const TAG = "selec_meter";
 
 static const uint8_t EM2M_REGISTER_COUNT = 34;  // 34 x 16-bit registers
+
+static const char *read_state_name(ReadState state) {
+  switch (state) {
+    case ReadState::MAIN_BLOCK:
+      return "main block";
+    case ReadState::SERIAL_NUMBER:
+      return "serial number";
+    case ReadState::DG_SENSING:
+      return "DG sensing";
+    case ReadState::IDLE:
+    default:
+      return "idle";
+  }
+}
 
 static float decode_float(std::span<const uint8_t> data, size_t i, float unit, bool word_swapped) {
   uint32_t temp = word_swapped ? encode_uint32(data[i + 2], data[i + 3], data[i], data[i + 1])
@@ -34,56 +49,76 @@ ReadState SelecMeter::next_read_state_after_main_block_() {
   return ReadState::IDLE;
 }
 
+ReadState SelecMeter::next_read_state_after_(ReadState current) {
+  switch (current) {
+    case ReadState::MAIN_BLOCK:
+      return this->next_read_state_after_main_block_();
+    case ReadState::SERIAL_NUMBER:
+#ifdef USE_BINARY_SENSOR
+      return this->dg_sensing_sensor_ != nullptr ? ReadState::DG_SENSING : ReadState::IDLE;
+#else
+      return ReadState::IDLE;
+#endif
+    case ReadState::DG_SENSING:
+    case ReadState::IDLE:
+    default:
+      return ReadState::IDLE;
+  }
+}
+
 void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) {
   this->waiting_for_response_ = false;
+  this->status_clear_warning();
+  ReadState current = this->read_state_;
   auto data = modbus::helpers::server_pdu_payload(response_pdu);
-  switch (this->read_state_) {
+  switch (current) {
     case ReadState::MAIN_BLOCK:
       if (this->model_ == Model::EM4M) {
         this->decode_em4m_(data);
       } else {
         this->decode_em2m_(data);
       }
-      this->read_state_ = this->next_read_state_after_main_block_();
       break;
     case ReadState::SERIAL_NUMBER:
 #ifdef USE_TEXT_SENSOR
       this->decode_serial_number_(data);
-#endif
-#ifdef USE_BINARY_SENSOR
-      this->read_state_ = this->dg_sensing_sensor_ != nullptr ? ReadState::DG_SENSING : ReadState::IDLE;
-#else
-      this->read_state_ = ReadState::IDLE;
 #endif
       break;
     case ReadState::DG_SENSING:
 #ifdef USE_BINARY_SENSOR
       this->decode_dg_sensing_(data);
 #endif
-      this->read_state_ = ReadState::IDLE;
       break;
     case ReadState::IDLE:
       break;
   }
+  this->read_state_ = this->next_read_state_after_(current);
+  if (this->read_state_ == ReadState::IDLE)
+    this->disable_loop();
+}
+
+void SelecMeter::fail_current_read_(const char *reason) {
+  ESP_LOGW(TAG, "%s while reading %s", reason, read_state_name(this->read_state_));
+  this->status_set_warning();
+  this->waiting_for_response_ = false;
+  this->read_state_ = this->next_read_state_after_(this->read_state_);
+  if (this->read_state_ == ReadState::IDLE)
+    this->disable_loop();
 }
 
 void SelecMeter::on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) {
-  ESP_LOGW(TAG, "Modbus error: exception 0x%02X", static_cast<uint8_t>(exception_code));
-  this->waiting_for_response_ = false;
-  this->read_state_ = ReadState::IDLE;
+  char reason[32];
+  snprintf(reason, sizeof(reason), "Modbus error 0x%02X", static_cast<uint8_t>(exception_code));
+  this->fail_current_read_(reason);
 }
 
 bool SelecMeter::on_no_response(std::span<const uint8_t> request_pdu) {
-  ESP_LOGW(TAG, "No Modbus response");
-  this->waiting_for_response_ = false;
-  this->read_state_ = ReadState::IDLE;
+  this->fail_current_read_("No Modbus response");
   return false;
 }
 
 void SelecMeter::on_not_sent(std::span<const uint8_t> request_pdu) {
-  ESP_LOGW(TAG, "Modbus request not sent");
-  this->waiting_for_response_ = false;
-  this->read_state_ = ReadState::IDLE;
+  this->fail_current_read_("Modbus request not sent");
 }
 
 #ifdef USE_TEXT_SENSOR
@@ -112,6 +147,10 @@ void SelecMeter::decode_dg_sensing_(std::span<const uint8_t> data) {
     return;
   }
   float value = decode_float(data, 0, NO_DEC_UNIT, this->word_swap_);
+  if (!std::isfinite(value)) {
+    ESP_LOGW(TAG, "Non-finite DG sensing value, ignoring");
+    return;
+  }
   this->dg_sensing_sensor_->publish_state(value != 0);
 }
 #endif
@@ -316,10 +355,16 @@ void SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
     this->net_apparent_energy_dg_sensor_->publish_state(get_float(EM4M_NET_APPARENT_ENERGY_DG * 2, NO_DEC_UNIT));
 }
 
+void SelecMeter::setup() {
+  // Nothing to do until the first update(); keep the component off the hot loop until then.
+  this->disable_loop();
+}
+
 void SelecMeter::update() {
   if (this->waiting_for_response_ || this->read_state_ != ReadState::IDLE)
     return;
   this->read_state_ = ReadState::MAIN_BLOCK;
+  this->enable_loop();
 }
 
 void SelecMeter::loop() {
@@ -346,12 +391,9 @@ void SelecMeter::loop() {
   }
 
   // A false return means the request was refused at send_pdu() (e.g. tx buffer full) and no terminal
-  // callback will ever follow -- clear the flag ourselves or waiting_for_response_ latches forever.
-  if (!sent) {
-    ESP_LOGW(TAG, "Modbus request refused");
-    this->waiting_for_response_ = false;
-    this->read_state_ = ReadState::IDLE;
-  }
+  // callback will ever follow -- unwind ourselves via the same path the async failure callbacks use.
+  if (!sent)
+    this->fail_current_read_("Modbus request refused");
 }
 
 void SelecMeter::dump_config() {

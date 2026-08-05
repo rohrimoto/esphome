@@ -111,6 +111,7 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   void set_dg_sensing_sensor(binary_sensor::BinarySensor *dg_sensing) { this->dg_sensing_sensor_ = dg_sensing; }
 #endif
 
+  void setup() override;
   void update() override;
   void loop() override;
 
@@ -131,6 +132,13 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   void decode_dg_sensing_(std::span<const uint8_t> data);
 #endif
   ReadState next_read_state_after_main_block_();
+  // Advances the state machine from `current`, whether it just succeeded or failed -- a bad
+  // transaction on one register range shouldn't cancel the other, independent reads in the chain.
+  ReadState next_read_state_after_(ReadState current);
+  // Clears waiting_for_response_, marks the component unhealthy, advances read_state_, and
+  // disables loop() once the chain reaches IDLE. Shared by on_error()/on_no_response()/on_not_sent()
+  // and the refused-send path in loop().
+  void fail_current_read_(const char *reason);
 
   Model model_{Model::EM2M};
   bool word_swap_{false};
