@@ -452,14 +452,112 @@ async def test_uart_mock_modbus_shared_address(
         _assert_no_modbus_errors(error_log_lines, warning_log_lines)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Fair bus scheduling across controllers sharing one client hub "
-    "requires the modbus_controller refactor in esphome#11781. On dev the "
-    "controllers each queue independently and contend for the bus, so the "
-    "request counts diverge. Expected to XPASS (and this marker removed) once "
-    "that refactor lands.",
-)
+@pytest.mark.asyncio
+async def test_uart_mock_modbus_custom_pdu(
+    yaml_config: str,
+    run_compiled: RunCompiledFunction,
+    api_client_connected: APIClientConnectedFactory,
+) -> None:
+    """Test a custom_pdu sensor reading a register served by the mock server.
+
+    The custom_pdu is a raw read-holding PDU (function code + address + count); the
+    controller prepends its own device address and appends the CRC, sends it, and the
+    sensor's lambda parses the response payload. Confirms the custom PDU path decodes
+    the function code and routes the response to the sensor (the gap that hid the
+    step-2 raw-vs-PDU bug). A plain read on the same register anchors the bus.
+    """
+
+    line_callback, error_log_lines, warning_log_lines = _make_modbus_line_callback()
+
+    expected_values = {"plain_read": 259, "custom_read": 259}
+    tracker = SensorTracker(list(expected_values.keys()))
+    futures = tracker.expect_all(expected_values)
+
+    async with (
+        run_compiled(yaml_config, line_callback=line_callback),
+        api_client_connected() as client,
+    ):
+        await tracker.setup_and_start_scenario(client)
+        await tracker.await_all(futures)
+        _assert_no_modbus_errors(error_log_lines, warning_log_lines)
+
+
+@pytest.mark.asyncio
+async def test_uart_mock_modbus_continuous(
+    yaml_config: str,
+    run_compiled: RunCompiledFunction,
+    api_client_connected: APIClientConnectedFactory,
+) -> None:
+    """Test that `continuous: true` polls faster than the update_interval.
+
+    The controller's update_interval is 30s, so without continuous polling only the boot poll would
+    run during the short test window. With continuous the read is re-queued after each success, filling
+    idle bus time, so many reads arrive. The server returns an incrementing counter, so every read is a
+    distinct published state the tracker can count. (Bus warnings are not asserted here: continuous
+    polling deliberately saturates the bus, so the occasional timing hiccup is expected and off-topic;
+    the other tests cover clean operation at normal poll rates.)
+    """
+
+    tracker = SensorTracker(["continuous_reg"])
+
+    async with (
+        run_compiled(yaml_config),
+        api_client_connected() as client,
+    ):
+        # setup_and_start_scenario presses the Start Scenario button, whose on_press triggers the
+        # controller's first update(). With continuous that one read re-queues and streams; without it
+        # the next poll would not run until the 30s update_interval elapses.
+        await tracker.setup_and_start_scenario(client)
+        # Count reads over a window far shorter than the update_interval. Absent continuous polling we
+        # would see ~1 (the triggered poll); continuous re-queues, so the bus fills with reads.
+        await asyncio.sleep(3.0)
+        reads = len(tracker.sensor_states["continuous_reg"])
+        assert reads >= 5, (
+            "expected many continuous reads within the window (update_interval is 30s, so absent "
+            f"continuous polling we would see ~1), got {reads}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_uart_mock_modbus_offline(
+    yaml_config: str,
+    run_compiled: RunCompiledFunction,
+    api_client_connected: APIClientConnectedFactory,
+) -> None:
+    """A silent device drives the controller offline; answering again recovers it.
+
+    The mock answers nothing at first, so the controller burns through max_cmd_retries
+    (1 retry after the first timeout) and fires on_offline. While offline it keeps
+    retrying every offline_skip_updates+1 cycles. The test then flips the mock to
+    answering; the next retry gets a response, on_online fires, and the register value
+    publishes. This pins the pooled non-response counter, can_send() gating, the
+    offline retry cadence, and recovery - none of which the responding-path tests touch.
+    """
+
+    tracker = SensorTracker(["link_state", "reg"])
+    offline_future = tracker.expect("link_state", 0)
+
+    async with (
+        run_compiled(yaml_config),
+        api_client_connected() as client,
+    ):
+        entities = await tracker.setup_and_start_scenario(client)
+
+        # The unanswered poll and its retry each time out (~100ms), then on_offline fires.
+        await tracker.await_change(offline_future, "link_state", timeout=5.0)
+
+        # Register the recovery expectations before waking the device so no update is missed.
+        online_future = tracker.expect("link_state", 1)
+        value_future = tracker.expect("reg", 259)
+        serve_btn = find_entity(entities, "serve", ButtonInfo)
+        assert serve_btn is not None, "Serve button not found"
+        client.button_command(serve_btn.key)
+
+        # The next offline-cadence retry gets an answer: back online, value published.
+        await tracker.await_change(online_future, "link_state", timeout=5.0)
+        await tracker.await_change(value_future, "reg", timeout=5.0)
+
+
 @pytest.mark.asyncio
 async def test_uart_mock_modbus_fairness(
     yaml_config: str,
