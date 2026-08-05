@@ -7,7 +7,6 @@
 #include "esphome/core/automation.h"
 
 #include <list>
-#include <queue>
 #include <set>
 #include <span>
 #include <utility>
@@ -17,6 +16,7 @@ namespace esphome::modbus_controller {
 
 class ModbusController;
 
+using modbus::EntityType;
 using modbus::ExceptionCode;
 using modbus::FunctionCode;
 using modbus::helpers::SensorValueType;
@@ -28,6 +28,13 @@ using modbus::ModbusExceptionCode;
 using modbus::ModbusFunctionCode;
 using modbus::ModbusRegisterType;
 #pragma GCC diagnostic pop
+
+// Heap-free buffers a platform write lambda fills (byte PDUs for switch/binary output, register words
+// for number/select/float output). Sized to the largest spec-valid write so a conformant write never
+// truncates; they live on the stack for the duration of one write call, so the fixed size costs no
+// persistent RAM. push_back-based lambdas keep working; over-long writes are dropped past capacity.
+using ModbusWriteBytes = StaticVector<uint8_t, modbus::MAX_PDU_SIZE>;
+using ModbusWriteRegisters = StaticVector<uint16_t, modbus::MAX_NUM_OF_REGISTERS_TO_WRITE>;
 
 // Remove before 2026.10.0 — these helpers have moved to modbus::helpers
 ESPDEPRECATED("Use modbus::helpers::value_type_is_float() instead. Removed in 2026.10.0", "2026.4.0")
@@ -133,9 +140,7 @@ class SensorItem {
   virtual void parse_and_publish(std::span<const uint8_t> data) = 0;
 
   /// Coils and discrete inputs address individual bits; every other type addresses 16-bit registers.
-  bool addresses_bits() const {
-    return this->register_type == modbus::EntityType::COIL || this->register_type == modbus::EntityType::DISCRETE_INPUT;
-  }
+  bool addresses_bits() const { return modbus::helpers::is_entity_type_binary(this->register_type); }
 
   /// Address a write entity (switch/number/select) targets, derived from its resolved position within
   /// the range so that a write lands on the register the sensor reads from.
@@ -159,7 +164,7 @@ class SensorItem {
     this->range_start_address = address;
   }
 
-  void set_custom_data(const std::vector<uint8_t> &data) { custom_data = data; }
+  void set_custom_pdu(const std::vector<uint8_t> &pdu) { custom_pdu = pdu; }
   size_t virtual get_register_size() const {
     if (this->addresses_bits()) {
       return 1;
@@ -189,11 +194,18 @@ class SensorItem {
   /// First register of the range this sensor is polled in; equals start_address for an unpolled item.
   uint16_t range_start_address{0};
   uint16_t skip_updates{0};
-  std::vector<uint8_t> custom_data{};
+  std::vector<uint8_t> custom_pdu{};
   bool force_new_range{false};
+
+ protected:
+  /// Warn once per entity that filling the write_lambda buffer parameter is deprecated (the entity is now the
+  /// command - call a write helper / send_pdu() on `item` instead). The buffer parameter is removed in 2027.2.0.
+  void warn_write_buffer_deprecated_(const char *entity_name);
+  /// Set once warn_write_buffer_deprecated_() has fired, so the deprecation warning is logged only once per entity.
+  bool write_buffer_deprecated_warned_{false};
 };
 
-// ModbusController::create_register_ranges_ tries to optimize register range
+// ModbusController::create_polling_commands_ tries to optimize register range
 // for this the sensors must be ordered by register_type, start_address and bitmask
 class SensorItemsComparator {
  public:
@@ -232,119 +244,221 @@ struct RegisterRange {
   uint16_t start_address;
   modbus::EntityType register_type;
   uint8_t register_count;
-  uint16_t skip_updates;          // the config value
-  SensorSet sensors;              // all sensors of this range
-  uint16_t skip_updates_counter;  // the running value
+  uint16_t skip_updates;  // the config value
+  SensorSet sensors;      // all sensors of this range
 };
 
-class ModbusCommandItem {
+/// A hub device owned by a ModbusController. Centralises everything that talks back to the controller -
+/// firing the on_command_sent trigger, online/offline tracking and retry counting - so both the range
+/// polling commands (ModbusCommandItem) and the writer entities (which also inherit this) behave
+/// identically. The write helpers record that a frame was dispatched, so a write lambda can tell "I sent
+/// it myself" from "use the default write". The callback bodies live in the .cpp because ModbusController
+/// is incomplete here; they are the DEFAULT for a writer entity (online-track on a response, retry on a
+/// timeout, fire the trigger on send). ModbusCommandItem overrides them to add dispatch + unqueue.
+class ModbusControllerDevice : public modbus::ModbusClientDevice {
  public:
-  static const size_t MAX_PAYLOAD_BYTES = 240;
-  ModbusController *modbusdevice{nullptr};
-  uint16_t register_address{0};
-  uint16_t register_count{0};
-  FunctionCode function_code{FunctionCode::CUSTOM};
-  modbus::EntityType register_type{modbus::EntityType::CUSTOM};
-  std::function<void(modbus::EntityType register_type, uint16_t start_address, const std::vector<uint8_t> &data)>
-      on_data_func;
-  std::vector<uint8_t> payload = {};
-  bool send();
-  /// Check if the command should be retried based on the max_retries parameter
-  bool should_retry(uint8_t max_retries) { return this->send_count_ <= max_retries; };
+  ModbusControllerDevice() = default;
+  ModbusControllerDevice(ModbusController &controller, modbus::ModbusClientHub *parent, uint8_t address)
+      : modbus::ModbusClientDevice(parent, address), controller_(&controller) {}
 
-  /// factory methods
-  /** Create modbus read command
-   *  Function code 02-04
-   * @param modbusdevice pointer to the device to execute the command
-   * @param function_code modbus function code for the read command
-   * @param start_address modbus address of the first register to read
-   * @param register_count number of registers to read
-   * @param handler function called when the response is received
+  /// Whether a frame was queued to the hub since the last clear_dispatched_() (set by the write helpers).
+  bool dispatched() const { return this->dispatched_; }
+
+  // Write helpers: shadow the ModbusClientDevice ones to record the dispatch (so a write lambda's use of
+  // them is detectable), then delegate to the base which builds the PDU and queues it. The device address
+  // and CRC are added by the hub; on_command_sent fires from on_sent() with the request PDU.
+  bool write_single_register(uint16_t address, uint16_t value) {
+    this->dispatched_ = true;
+    return modbus::ModbusClientDevice::write_single_register(address, value);
+  }
+  bool write_single_coil(uint16_t address, bool value) {
+    this->dispatched_ = true;
+    return modbus::ModbusClientDevice::write_single_coil(address, value);
+  }
+  bool write_multiple_registers(uint16_t address, std::span<const uint16_t> values) {
+    this->dispatched_ = true;
+    return modbus::ModbusClientDevice::write_multiple_registers(address, values);
+  }
+  bool write_multiple_coils(uint16_t address, std::span<const bool> values) {
+    this->dispatched_ = true;
+    return modbus::ModbusClientDevice::write_multiple_coils(address, values);
+  }
+  /// Send a custom PDU (function code + data; the hub adds the device address and CRC).
+  bool send_pdu(std::span<const uint8_t> pdu, modbus::CommandOptions options = {}) {
+    this->dispatched_ = true;
+    return modbus::ModbusClientDevice::send_pdu(pdu, options);
+  }
+  /// Send a legacy raw frame (address + function code + data; the hub adds the CRC) to the frame's own
+  /// address byte. Serves only the deprecated write_lambda buffer path. Remove before 2027.2.0.
+  void send_raw_frame_deprecated(std::span<const uint8_t> frame);
+
+  void on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) override;
+  void on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) override;
+  void on_sent(std::span<const uint8_t> request_pdu) override;
+  bool on_no_response(std::span<const uint8_t> request_pdu) override;
+
+ protected:
+  /// Ctor used by the value-type copy/move paths (ModbusCommandItem stored in containers).
+  ModbusControllerDevice(modbus::ModbusClientHub *parent, uint8_t address, ModbusController *controller)
+      : modbus::ModbusClientDevice(parent, address), controller_(controller) {}
+  /// Bind this device to a controller: stores it and sets the hub + device address from it.
+  void set_controller_(ModbusController *controller);
+  void clear_dispatched_() { this->dispatched_ = false; }
+  /// Mark the device online after a response; function code + address are decoded from request_pdu.
+  void notify_online_(std::span<const uint8_t> request_pdu);
+  /// Count a timeout; returns true if the hub should retry, false (and marks offline) when exhausted.
+  bool note_no_response_(std::span<const uint8_t> request_pdu);
+  /// Function code / register address decoded from a request PDU ([fc, addr_hi, addr_lo, ...]).
+  static int fc_of(std::span<const uint8_t> pdu) { return pdu.empty() ? 0 : (pdu[0] & modbus::FUNCTION_CODE_MASK); }
+  static int addr_of(std::span<const uint8_t> pdu) {
+    return pdu.size() >= 3 ? modbus::helpers::get_data<uint16_t>(pdu.data(), 1) : 0;
+  }
+
+  ModbusController *controller_{nullptr};
+  bool dispatched_{false};
+};
+
+/// A single modbus command owned by a controller: a range read (polling), a custom-PDU poll, or a
+/// command built by the deprecated create_* factories. It dispatches a read response to its sensors and
+/// removes itself from the controller's one-shot list (via unqueue_command) once it completes.
+class ModbusCommandItem : public ModbusControllerDevice {
+ public:
+  /// Empty command with no controller connection (kept for source compatibility with value-type usage).
+  ModbusCommandItem(ModbusController &controller, modbus::ModbusClientHub *parent, uint8_t address)
+      : ModbusControllerDevice(controller, parent, address) {}
+  /// Read/custom polling command from a range; the PDU is rebuilt from these fields (or borrows the sensor's
+  /// custom_pdu) at send time.
+  ModbusCommandItem(ModbusController &controller, modbus::ModbusClientHub *parent, uint8_t address,
+                    RegisterRange &&range);
+  /// Build a custom polling command that references the sensor's ready-made raw frame.
+  ModbusCommandItem(ModbusController &controller, modbus::ModbusClientHub *parent, uint8_t address, SensorItem *sensor);
+
+  // The base deletes copy/move (its destructor unregisters the device from the hub queue), but command
+  // items are stored in value containers, so copy/move CONSTRUCTION is re-provided (copy only for the
+  // queue_command() path). Assignment stays deleted: the item's address-in-memory is its hub identity.
+  ModbusCommandItem(const ModbusCommandItem &other);
+  ModbusCommandItem(ModbusCommandItem &&other) noexcept;
+  ModbusCommandItem &operator=(ModbusCommandItem &&) = delete;
+
+  SensorSet sensors;  // sensors served by this command (empty for factory/write commands)
+  uint16_t skip_updates{0};
+  std::function<void(EntityType register_type, uint16_t start_address, std::span<const uint8_t> data)> on_data_func;
+  /// Staging buffer for the deprecated create_* factories: a full PDU, or a raw frame when payload_is_raw_frame_.
+  /// Empty for reads (rebuilt from the range fields) and custom polling (borrows the sensor's custom_pdu). Small
+  /// writes stay in the 8-byte inline buffer; large frames spill once to the heap. Remove before 2027.2.0.
+  SmallInlineBuffer<8> payload;
+  // Set by unqueue_command() when this one-shot has completed. The controller erases flagged items at a
+  // safe point (update()/queue_command()), never from inside the command's own callback.
+  bool pending_removal{false};
+
+  // Override the ModbusControllerDevice defaults to add read-response dispatch to this command's sensors
+  // and removal from the controller's one-shot list once the command completes.
+  void on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) override;
+  void on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) override;
+  void on_not_sent(std::span<const uint8_t> request_pdu) override;
+  bool on_no_response(std::span<const uint8_t> request_pdu) override;
+
+  uint16_t register_address() const { return this->start_address_; }
+  uint16_t register_count() const { return this->register_count_; }
+  EntityType register_type() const { return this->register_type_; }
+
+  /// Queue this command's frame on the hub. Returns false when refused, in which case no callback ever comes.
+  /// Options pass straight through to the hub; the polling path sets continuous from the controller's
+  /// continuous mode so reads re-queue after each success, one-shot commands keep the default.
+  bool send(modbus::CommandOptions options = {});
+
+  /// factory methods (deprecated: use ModbusController::create_command() and the item's write helpers / send_pdu())
+  /** Create modbus write multiple registers command
+   *  Function 16 (10hex) Write Multiple Registers
+   * @param controller the controller whose hub and address the command uses
+   * @param start_address modbus address of the first register to write
+   * @param register_count number of registers to write
+   * @param values register values to write
    * @return ModbusCommandItem with the prepared command
    */
-  static ModbusCommandItem create_read_command(
-      ModbusController *modbusdevice, modbus::EntityType register_type, uint16_t start_address, uint16_t register_count,
-      std::function<void(modbus::EntityType register_type, uint16_t start_address, const std::vector<uint8_t> &data)>
-          &&handler);
-  /** Create modbus read command
-   *  Function code 02-04
-   * @param modbusdevice pointer to the device to execute the command
-   * @param function_code modbus function code for the read command
-   * @param start_address modbus address of the first register to read
-   * @param register_count number of registers to read
-   * @return ModbusCommandItem with the prepared command
-   */
-  static ModbusCommandItem create_read_command(ModbusController *modbusdevice, modbus::EntityType register_type,
-                                               uint16_t start_address, uint16_t register_count);
-  /** Create modbus read command
-   *  Function code 02-04
-   * @param modbusdevice pointer to the device to execute the command
-   * @param function_code modbus function code for the read command
-   * @param start_address modbus address of the first register to read
-   * @param register_count number of registers to read
-   * @param handler function called when the response is received
-   * @return ModbusCommandItem with the prepared command
-   */
-  static ModbusCommandItem create_write_multiple_command(ModbusController *modbusdevice, uint16_t start_address,
+  ESPDEPRECATED("Use ModbusController::create_command() and call write_multiple_registers() on the item instead. "
+                "Removed in 2027.2.0",
+                "2026.8.0")
+  static ModbusCommandItem create_write_multiple_command(ModbusController *controller, uint16_t start_address,
                                                          uint16_t register_count, const std::vector<uint16_t> &values);
   /** Create modbus write multiple registers command
    *  Function 16 (10hex) Write Multiple Registers
-   * @param modbusdevice pointer to the device to execute the command
+   * @param controller the controller whose hub and address the command uses
    * @param start_address modbus address of the first register to read
    * @param register_count number of registers to read
    * @param value uint16_t single register value to write
    * @return ModbusCommandItem with the prepared command
    */
-  static ModbusCommandItem create_write_single_command(ModbusController *modbusdevice, uint16_t start_address,
+  ESPDEPRECATED("Use ModbusController::create_command() and call write_single_register() on the item instead. "
+                "Removed in 2027.2.0",
+                "2026.8.0")
+  static ModbusCommandItem create_write_single_command(ModbusController *controller, uint16_t start_address,
                                                        uint16_t value);
   /** Create modbus write single registers command
    *  Function 05 (05hex) Write Single Coil
-   * @param modbusdevice pointer to the device to execute the command
+   * @param controller the controller whose hub and address the command uses
    * @param start_address modbus address of the first register to read
    * @param value uint16_t data to be written to the registers
    * @return ModbusCommandItem with the prepared command
    */
-  static ModbusCommandItem create_write_single_coil(ModbusController *modbusdevice, uint16_t address, bool value);
+  ESPDEPRECATED("Use ModbusController::create_command() and call write_single_coil() on the item instead. "
+                "Removed in 2027.2.0",
+                "2026.8.0")
+  static ModbusCommandItem create_write_single_coil(ModbusController *controller, uint16_t address, bool value);
 
   /** Create modbus write multiple registers command
    *  Function 15 (0Fhex) Write Multiple Coils
-   * @param modbusdevice pointer to the device to execute the command
+   * @param controller the controller whose hub and address the command uses
    * @param start_address modbus address of the first register to read
    * @param value bool vector of values to be written to the registers
    * @return ModbusCommandItem with the prepared command
    */
-  static ModbusCommandItem create_write_multiple_coils(ModbusController *modbusdevice, uint16_t start_address,
+  ESPDEPRECATED("Use ModbusController::create_command() and call write_multiple_coils() on the item instead. "
+                "Removed in 2027.2.0",
+                "2026.8.0")
+  static ModbusCommandItem create_write_multiple_coils(ModbusController *controller, uint16_t start_address,
                                                        const std::vector<bool> &values);
-  /** Create custom modbus command
-   * @param modbusdevice pointer to the device to execute the command
-   * @param values byte vector of data to be sent to the device. The complete payload must be provided with the
-   * exception of the crc codes
-   * @param handler function called when the response is received. Default is just logging a response
+  /** Create custom modbus command (fire and forget - the response is not routed anywhere)
+   * @param controller the controller whose hub and address the command uses
+   * @param values byte vector of a legacy raw frame (device address + function code + data; the CRC is added)
    * @return ModbusCommandItem with the prepared command
    */
-  static ModbusCommandItem create_custom_command(
-      ModbusController *modbusdevice, const std::vector<uint8_t> &values,
-      std::function<void(modbus::EntityType register_type, uint16_t start_address, const std::vector<uint8_t> &data)>
-          &&handler = nullptr);
+  ESPDEPRECATED("Use the modbus_client.send action, or subclass modbus::ModbusClientDevice, instead. "
+                "Removed in 2027.2.0",
+                "2026.8.0")
+  static ModbusCommandItem create_custom_command(ModbusController *controller, const std::vector<uint8_t> &values);
 
-  /** Create custom modbus command
-   * @param modbusdevice pointer to the device to execute the command
-   * @param values word vector of data to be sent to the device. The complete payload must be provided with the
-   * exception of the crc codes
-   * @param handler function called when the response is received. Default is just logging a response
+  /** Create custom modbus command from words, packed big-endian (fire and forget - the response is not routed
+   * anywhere)
+   * @param controller the controller whose hub and address the command uses
+   * @param values word vector of a legacy raw frame (device address + function code + data; the CRC is added)
    * @return ModbusCommandItem with the prepared command
    */
-  static ModbusCommandItem create_custom_command(
-      ModbusController *modbusdevice, const std::vector<uint16_t> &values,
-      std::function<void(modbus::EntityType register_type, uint16_t start_address, const std::vector<uint8_t> &data)>
-          &&handler = nullptr);
-
-  bool is_equal(const ModbusCommandItem &other);
+  ESPDEPRECATED("Use the modbus_client.send action, or subclass modbus::ModbusClientDevice, instead. "
+                "Removed in 2027.2.0",
+                "2026.8.0")
+  static ModbusCommandItem create_custom_command(ModbusController *controller, const std::vector<uint16_t> &values);
 
  protected:
-  // wrong commands (esp. custom commands) can block the send queue, limit the number of repeats.
-  /// How many times this command has been sent
-  uint8_t send_count_{0};
+  /// Shared non-warning impl for the deprecated overloads; `values` is a legacy raw frame (address +
+  /// function code + data) sent to its own address byte.
+  static ModbusCommandItem custom_command_impl(ModbusController *controller, std::span<const uint8_t> values);
+  void set_command_(FunctionCode function_code, EntityType register_type, uint16_t start_address,
+                    uint16_t register_count) {
+    this->function_code_ = function_code;
+    this->register_type_ = register_type;
+    this->start_address_ = start_address;
+    this->register_count_ = register_count;
+  }
+  EntityType register_type_{EntityType::CUSTOM};
+  uint16_t start_address_{0};
+  uint16_t register_count_{0};
+  FunctionCode function_code_{FunctionCode::INVALID};
+  /// Custom polling commands reference the PDU bytes owned by their SensorItem instead of copying them.
+  const std::vector<uint8_t> *custom_pdu_{nullptr};
+  /// True when `payload` holds a legacy raw frame rather than a PDU; set by custom_command_impl(). Remove before
+  /// 2027.2.0.
+  bool payload_is_raw_frame_{false};
 };
 
 /** Modbus controller class.
@@ -355,48 +469,55 @@ class ModbusCommandItem {
  * Responses for the commands are dispatched to the modbus sensor items.
  */
 
-class ModbusController final : public PollingComponent, public modbus::ModbusClientDevice {
+class ModbusController final : public PollingComponent {
  public:
   void dump_config() override;
-  void loop() override;
+  // The hub owns transmit/receive timing; each command routes its own response, so the controller has
+  // nothing to pump per loop.
+  void loop() override { this->disable_loop(); }
   void setup() override;
   void update() override;
 
-  /// queues a modbus command in the send queue
-  void queue_command(const ModbusCommandItem &command);
-  /// Sends a raw payload (address byte + PDU, no CRC) with responses routed back to this controller.
-  /// The payload carries its own address byte, which may differ from this controller's address.
-  /// Deliberately shadows the deprecated ModbusClientDevice::send_raw() with identical semantics:
-  /// controller-level raw sends stay supported until the command machinery is replaced.
-  void send_raw(const std::vector<uint8_t> &payload) {
-    if (payload.empty())
-      return;  // refused at the door, like every invalid send; no callback follows
-    this->parent_->send_pdu(payload[0], std::span<const uint8_t>(payload).subspan(1), this);
+  // The controller is not itself a modbus device - its commands and writer entities send as their own
+  // devices. It only owns the hub + address so those senders can be built against them.
+  void set_parent(modbus::ModbusClientHub *hub) { this->hub_ = hub; }
+  void set_address(uint8_t address) { this->address_ = address; }
+
+  /// The hub and modbus address this controller talks to. Used to build commands/entities that send as
+  /// their own device.
+  modbus::ModbusClientHub *hub() const { return this->hub_; }
+  uint8_t device_address() const { return this->address_; }
+
+  /// Empty command on this controller's hub/address: own it, call a write helper / send_pdu(), keep it alive
+  /// until the reply.
+  ModbusCommandItem create_command() { return ModbusCommandItem(*this, this->hub_, this->address_); }
+  /// Build a polling command for a register range bound to this controller's hub and address.
+  ModbusCommandItem create_command(RegisterRange &&range) {
+    return ModbusCommandItem(*this, this->hub_, this->address_, std::move(range));
   }
+
+  /// Queues a one-shot modbus command (writes, custom commands); taken by value, so std::move to avoid a copy.
+  ESPDEPRECATED("Own a ModbusCommandItem that outlives the call (e.g. a std::optional member) and call a write "
+                "helper on it instead; for ad-hoc custom PDUs use a modbus_client component. Removed in 2027.2.0",
+                "2026.8.0")
+  void queue_command(ModbusCommandItem command);
+  /// Flags a finished one-shot command for removal. Called by the command as the last action of its own
+  /// callback, so the item is not destroyed here (send() and the hub still touch it) but swept later.
+  void unqueue_command(const ModbusCommandItem *command);
   /// Registers a sensor with the controller. Called by esphomes code generator
   void add_sensor_item(SensorItem *item) { sensorset_.insert(item); }
-  /// called when a modbus response was parsed without errors
-  void on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) override;
-  /// called when a modbus error response was received
-  void on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) override;
-  /// default delegate called by process_modbus_data when a response has retrieved from the incoming queue
-  void on_register_data(modbus::EntityType register_type, uint16_t start_address, const std::vector<uint8_t> &data);
-  /// default delegate called by process_modbus_data when a response for a write response has retrieved from the
-  /// incoming queue
-  void on_write_register_response(modbus::EntityType register_type, uint16_t start_address,
-                                  const std::vector<uint8_t> &data);
-  /// Allow a duplicate command to be sent
-  void set_allow_duplicate_commands(bool allow_duplicate_commands) {
-    this->allow_duplicate_commands_ = allow_duplicate_commands;
+  /// Update the online/offline state after a response or a run of timeouts, firing the callbacks.
+  void set_online(bool online, int function_code, int register_address);
+  /// Fire the on_command_sent trigger (called when a command's frame reaches the wire).
+  void command_sent(int function_code, int register_address) {
+    this->command_sent_callback_.call(function_code, register_address);
   }
-  /// get if a duplicate command can be sent
-  bool get_allow_duplicate_commands() { return this->allow_duplicate_commands_; }
-  /// called by esphome generated code to set the command_throttle period
-  void set_command_throttle(uint16_t command_throttle) { this->command_throttle_ = command_throttle; }
+  /// A command timed out; bump the consecutive-timeout counter used by can_send()/offline detection.
+  void increment_non_response_count() { this->cmd_non_responses_++; }
+  /// Whether more retries are allowed before the device is considered offline.
+  bool can_send() { return this->cmd_non_responses_ <= this->max_cmd_retries_; }
   /// called by esphome generated code to set the offline_skip_updates
   void set_offline_skip_updates(uint16_t offline_skip_updates) { this->offline_skip_updates_ = offline_skip_updates; }
-  /// get the number of queued modbus commands (should be mostly empty)
-  size_t get_command_queue_length() { return command_queue_.size(); }
   /// get if the module is offline, didn't respond the last command
   bool get_module_offline() { return module_offline_; }
   /// Set callback for commands
@@ -415,40 +536,56 @@ class ModbusController final : public PollingComponent, public modbus::ModbusCli
   void set_max_cmd_retries(uint8_t max_cmd_retries) { this->max_cmd_retries_ = max_cmd_retries; }
   /// get how many times a command will be (re)sent if no response is received
   uint8_t get_max_cmd_retries() { return this->max_cmd_retries_; }
+  /// called by esphome generated code to enable continuous polling (reads re-queue after each success to
+  /// fill idle bus time; update_interval remains the recovery path for a device that stops responding).
+  void set_continuous(bool continuous) { this->continuous_ = continuous; }
+  /// whether continuous polling is enabled
+  bool continuous() const { return this->continuous_; }
 
  protected:
   /// parse sensormap_ and create range of sequential addresses
-  size_t create_register_ranges_();
-  // find register in sensormap. Returns iterator with all registers having the same start address
-  SensorSet find_sensors_(modbus::EntityType register_type, uint16_t start_address) const;
-  /// submit the read command for the address range to the send queue
-  void update_range_(RegisterRange &r);
-  /// parse incoming modbus data
-  void process_modbus_data_(const ModbusCommandItem *response);
-  /// send the next modbus command from the send queue
-  bool send_next_command_();
-  /// dump the parsed sensormap for diagnostics
-  void dump_sensors_();
+  /// Group the registered sensors into contiguous ranges and create one polling command per range.
+  void create_polling_commands_();
+  /// build one persistent polling command from a range and add it to polling_command_items_
+  void create_polling_command_(RegisterRange &&range) {
+    // A custom range polls the first sensor's custom_pdu (referenced, not copied); the sensor constructor
+    // decodes the real function code. The response still dispatches to every sensor in the range.
+    if (range.register_type == EntityType::CUSTOM && !range.sensors.empty()) {
+      auto &cmd = this->polling_command_items_.emplace_back(*this, this->hub_, this->address_, *range.sensors.begin());
+      cmd.sensors = std::move(range.sensors);
+    } else {
+      this->polling_command_items_.emplace_back(*this, this->hub_, this->address_, std::move(range));
+    }
+  }
+  /// The hub this controller's commands/entities send through, and the modbus address they target.
+  modbus::ModbusClientHub *hub_{nullptr};
+  uint8_t address_{0};
   /// Collection of all sensors for this component
   SensorSet sensorset_;
-  /// Continuous range of modbus registers
-  std::vector<RegisterRange> register_ranges_{};
-  /// Hold the pending requests to be sent
-  std::list<std::unique_ptr<ModbusCommandItem>> command_queue_;
-  /// modbus response data waiting to get processed
-  std::queue<std::unique_ptr<ModbusCommandItem>> incoming_queue_;
-  /// if duplicate commands can be sent
-  bool allow_duplicate_commands_{false};
-  /// when was the last send operation
-  uint32_t last_command_timestamp_{0};
-  /// min time in ms between sending modbus commands
-  uint16_t command_throttle_{0};
+  /// One persistent command per register range, each its own ModbusClientDevice. Built once in setup()
+  /// (create_polling_commands_ feeds each range straight in; the vector may reallocate as it grows, which
+  /// is safe because no command has registered with the hub yet) and never appended to afterward, so the
+  /// hub's device pointers stay valid once commands start sending.
+  std::vector<ModbusCommandItem> polling_command_items_{};
+  /// Dynamically queued one-shot commands (writes, custom commands). std::list keeps stable addresses.
+  std::list<std::unique_ptr<ModbusCommandItem>> one_shot_command_items_;
+  /// Erases one-shot commands flagged by unqueue_command(). Called only from update()/queue_command(),
+  /// i.e. never inside a hub callback, so destroying the command (which detaches it from the hub) is safe.
+  void sweep_completed_one_shots_();
   /// if module didn't respond the last command
   bool module_offline_{false};
+  /// update_counter_ value at which the module went offline (for offline_skip_updates timing)
+  uint16_t module_offline_at_{0};
+  /// counts update() cycles; drives skip_updates and offline timing
+  uint16_t update_counter_{0};
+  /// consecutive non-responses; drives can_send() and offline detection
+  uint8_t cmd_non_responses_{0};
   /// how many updates to skip if module is offline
   uint16_t offline_skip_updates_{0};
   /// How many times we will retry a command if we get no response
   uint8_t max_cmd_retries_{4};
+  /// poll continuously (reads re-queue after each success) instead of only once per update_interval
+  bool continuous_{false};
   /// Command sent callback
   CallbackManager<void(int, int)> command_sent_callback_{};
   /// Server online callback
@@ -462,7 +599,7 @@ class ModbusController final : public PollingComponent, public modbus::ModbusCli
  * @param item SensorItem object
  * @return float value of data
  */
-inline float payload_to_float(std::span<const uint8_t> data, const SensorItem &item, size_t offset) {
+inline float payload_to_float(std::span<const uint8_t> data, const SensorItem &item, uint8_t offset) {
   int64_t number = modbus::helpers::payload_to_number(data, item.sensor_value_type, offset, item.bitmask).value_or(0);
 
   float float_value;

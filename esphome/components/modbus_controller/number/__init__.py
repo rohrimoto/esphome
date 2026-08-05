@@ -16,6 +16,7 @@ from esphome.const import (
 
 from .. import (
     ModbusItemBaseSchema,
+    ModbusWriteRegisters,
     SensorItem,
     add_modbus_base_properties,
     modbus_calc_properties,
@@ -23,7 +24,7 @@ from .. import (
 )
 from ..const import (
     CONF_BITMASK,
-    CONF_CUSTOM_COMMAND,
+    CONF_CUSTOM_PDU,
     CONF_FORCE_NEW_RANGE,
     CONF_MODBUS_CONTROLLER_ID,
     CONF_REGISTER_TYPE,
@@ -53,9 +54,9 @@ def validate_min_max(config):
 
 
 def validate_modbus_number(config):
-    if CONF_CUSTOM_COMMAND not in config and CONF_ADDRESS not in config:
+    if CONF_CUSTOM_PDU not in config and CONF_ADDRESS not in config:
         raise cv.Invalid(
-            f" {CONF_ADDRESS} is a required property if '{CONF_CUSTOM_COMMAND}:' isn't used"
+            f" {CONF_ADDRESS} is a required property if '{CONF_CUSTOM_PDU}:' isn't used"
         )
     return config
 
@@ -120,7 +121,7 @@ async def to_code(config):
             [
                 (ModbusNumber.operator("ptr"), "item"),
                 (cg.float_, "x"),
-                (cg.std_vector.template(cg.uint16).operator("ref"), "payload"),
+                (ModbusWriteRegisters.operator("ref"), "payload"),
             ],
             return_type=cg.optional.template(float),
         )

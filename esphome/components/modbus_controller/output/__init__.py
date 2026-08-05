@@ -6,12 +6,14 @@ from esphome.const import CONF_ADDRESS, CONF_ID, CONF_MULTIPLY
 
 from .. import (
     ModbusItemBaseSchema,
+    ModbusWriteBytes,
+    ModbusWriteRegisters,
     SensorItem,
     modbus_calc_properties,
     modbus_controller_ns,
 )
 from ..const import (
-    CONF_CUSTOM_COMMAND,
+    CONF_CUSTOM_PDU,
     CONF_MODBUS_CONTROLLER_ID,
     CONF_REGISTER_TYPE,
     CONF_USE_WRITE_MULTIPLE,
@@ -37,8 +39,8 @@ CONFIG_SCHEMA = cv.typed_schema(
             {
                 cv.GenerateID(): cv.declare_id(ModbusBinaryOutput),
                 cv.Required(CONF_ADDRESS): cv.positive_int,
-                cv.Optional(CONF_CUSTOM_COMMAND): cv.invalid(
-                    "custom_command is not supported for outputs"
+                cv.Optional(CONF_CUSTOM_PDU): cv.invalid(
+                    "custom_pdu is not supported for outputs; use a write_lambda instead"
                 ),
                 cv.Optional(CONF_WRITE_LAMBDA): cv.returning_lambda,
                 cv.Optional(CONF_USE_WRITE_MULTIPLE, default=False): cv.boolean,
@@ -48,8 +50,8 @@ CONFIG_SCHEMA = cv.typed_schema(
             {
                 cv.GenerateID(): cv.declare_id(ModbusFloatOutput),
                 cv.Required(CONF_ADDRESS): cv.positive_int,
-                cv.Optional(CONF_CUSTOM_COMMAND): cv.invalid(
-                    "custom_command is not supported for outputs"
+                cv.Optional(CONF_CUSTOM_PDU): cv.invalid(
+                    "custom_pdu is not supported for outputs; use a write_lambda instead"
                 ),
                 cv.Optional(CONF_VALUE_TYPE, default="U_WORD"): cv.enum(
                     SENSOR_VALUE_TYPE
@@ -82,7 +84,7 @@ async def to_code(config):
                 [
                     (ModbusBinaryOutput.operator("ptr"), "item"),
                     (cg.bool_, "x"),
-                    (cg.std_vector.template(cg.uint8).operator("ref"), "payload"),
+                    (ModbusWriteBytes.operator("ref"), "payload"),
                 ],
                 return_type=cg.optional.template(bool),
             )
@@ -102,7 +104,7 @@ async def to_code(config):
                 [
                     (ModbusFloatOutput.operator("ptr"), "item"),
                     (cg.float_, "x"),
-                    (cg.std_vector.template(cg.uint16).operator("ref"), "payload"),
+                    (ModbusWriteRegisters.operator("ref"), "payload"),
                 ],
                 return_type=cg.optional.template(float),
             )
