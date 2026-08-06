@@ -111,9 +111,7 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   void set_dg_sensing_sensor(binary_sensor::BinarySensor *dg_sensing) { this->dg_sensing_sensor_ = dg_sensing; }
 #endif
 
-  void setup() override;
   void update() override;
-  void loop() override;
 
   void on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) override;
   void on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) override;
@@ -135,9 +133,13 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   // Advances the state machine from `current`, whether it just succeeded or failed -- a bad
   // transaction on one register range shouldn't cancel the other, independent reads in the chain.
   ReadState next_read_state_after_(ReadState current);
-  // Clears waiting_for_response_, marks the component unhealthy, advances read_state_, and
-  // disables loop() once the chain reaches IDLE. Shared by on_error()/on_no_response()/on_not_sent()
-  // and the refused-send path in loop().
+  // Issues the read for `state` (or does nothing for IDLE), setting read_state_/waiting_for_response_
+  // as it goes. Sending from within a callback is safe per modbus.h's callback contract, so this is
+  // called directly from update() and, after decoding, from on_response()/fail_current_read_() --
+  // no deferral through loop() is needed.
+  void start_read_(ReadState state);
+  // Clears waiting_for_response_, marks the component unhealthy, and advances to the next read in
+  // the chain. Shared by on_error()/on_no_response()/on_not_sent() and a refused send in start_read_().
   void fail_current_read_(const char *reason);
 
   Model model_{Model::EM2M};

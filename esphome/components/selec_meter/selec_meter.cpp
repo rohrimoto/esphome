@@ -96,11 +96,10 @@ void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<con
       break;
     case ReadState::IDLE:
       ESP_LOGW(TAG, "Unexpected response while idle, dropping");
-      break;
+      return;
   }
-  this->read_state_ = this->next_read_state_after_(current);
-  if (this->read_state_ == ReadState::IDLE)
-    this->disable_loop();
+  // Safe per modbus.h's callback contract: sending from inside a callback is picked up normally.
+  this->start_read_(this->next_read_state_after_(current));
 }
 
 void SelecMeter::fail_current_read_(const char *reason) {
@@ -120,9 +119,7 @@ void SelecMeter::fail_current_read_(const char *reason) {
     this->dg_sensing_disabled_ = true;
   }
 #endif
-  this->read_state_ = this->next_read_state_after_(failed_state);
-  if (this->read_state_ == ReadState::IDLE)
-    this->disable_loop();
+  this->start_read_(this->next_read_state_after_(failed_state));
 }
 
 void SelecMeter::on_error(std::span<const uint8_t> request_pdu, modbus::ExceptionCode exception_code) {
@@ -376,29 +373,24 @@ void SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
     this->net_apparent_energy_dg_sensor_->publish_state(get_float(EM4M_NET_APPARENT_ENERGY_DG * 2, NO_DEC_UNIT));
 }
 
-void SelecMeter::setup() {
-  // Nothing to do until the first update(); keep the component off the hot loop until then.
-  this->disable_loop();
-}
-
 void SelecMeter::update() {
   if (this->waiting_for_response_ || this->read_state_ != ReadState::IDLE) {
     ESP_LOGD(TAG, "Skipping update: previous read cycle (%s) still in progress",
              read_state_name(this->read_state_));
     return;
   }
-  this->read_state_ = ReadState::MAIN_BLOCK;
-  this->enable_loop();
+  this->start_read_(ReadState::MAIN_BLOCK);
 }
 
-void SelecMeter::loop() {
-  if (this->waiting_for_response_ || this->read_state_ == ReadState::IDLE)
+void SelecMeter::start_read_(ReadState state) {
+  this->read_state_ = state;
+  if (state == ReadState::IDLE)
     return;
 
   this->waiting_for_response_ = true;
 
   bool sent = false;
-  switch (this->read_state_) {
+  switch (state) {
     case ReadState::MAIN_BLOCK: {
       uint8_t register_count = this->model_ == Model::EM4M ? EM4M_REGISTER_COUNT : EM2M_REGISTER_COUNT;
       sent = this->read_input_registers(0, register_count);
@@ -411,7 +403,7 @@ void SelecMeter::loop() {
       sent = this->read_input_registers(EM4M_DG_SENSING, 2);
       break;
     case ReadState::IDLE:
-      break;
+      return;
   }
 
   // A false return means the request was refused at send_pdu() (e.g. tx buffer full) and no terminal
