@@ -43,7 +43,7 @@ static float decode_float(std::span<const uint8_t> data, size_t i, float unit, b
 
 ReadState SelecMeter::next_read_state_after_main_block_() {
 #ifdef USE_TEXT_SENSOR
-  if (this->serial_number_sensor_ != nullptr && !this->serial_number_published_)
+  if (this->serial_number_sensor_ != nullptr && !this->serial_number_published_ && !this->serial_number_disabled_)
     return ReadState::SERIAL_NUMBER;
 #endif
 #ifdef USE_BINARY_SENSOR
@@ -73,17 +73,28 @@ ReadState SelecMeter::next_read_state_after_(ReadState current) {
 
 void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<const uint8_t> response_pdu) {
   this->waiting_for_response_ = false;
-  this->status_clear_warning();
   ReadState current = this->read_state_;
   auto data = modbus::helpers::server_pdu_payload(response_pdu);
   switch (current) {
-    case ReadState::MAIN_BLOCK:
-      if (this->model_ == Model::EM4M) {
-        this->decode_em4m_(data);
+    case ReadState::MAIN_BLOCK: {
+      bool ok = this->model_ == Model::EM4M ? this->decode_em4m_(data) : this->decode_em2m_(data);
+      if (ok) {
+        // A good main-block read proves the bus and the meter are alive, so any earlier failures on
+        // the optional side reads were transient -- re-arm them instead of leaving them given up on.
+        this->status_clear_warning();
+#ifdef USE_TEXT_SENSOR
+        this->serial_number_failures_ = 0;
+        this->serial_number_disabled_ = false;
+#endif
+#ifdef USE_BINARY_SENSOR
+        this->dg_sensing_failures_ = 0;
+        this->dg_sensing_disabled_ = false;
+#endif
       } else {
-        this->decode_em2m_(data);
+        this->status_set_warning();
       }
       break;
+    }
     case ReadState::SERIAL_NUMBER:
 #ifdef USE_TEXT_SENSOR
       this->decode_serial_number_(data);
@@ -105,19 +116,18 @@ void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<con
 void SelecMeter::fail_current_read_(const char *reason) {
   ReadState failed_state = this->read_state_;
   ESP_LOGW(TAG, "%s while reading %s", reason, read_state_name(failed_state));
-  this->status_set_warning();
   this->waiting_for_response_ = false;
+  // Only the main block (the actual measurements) drives component health -- a meter that simply
+  // doesn't support an optional side read shouldn't flap an otherwise-healthy meter into a warning.
+  if (failed_state == ReadState::MAIN_BLOCK)
+    this->status_set_warning();
 #ifdef USE_TEXT_SENSOR
-  if (failed_state == ReadState::SERIAL_NUMBER && ++this->serial_number_failures_ >= MAX_OPTIONAL_READ_FAILURES) {
-    ESP_LOGW(TAG, "Serial number read failed %u times in a row, giving up", this->serial_number_failures_);
-    this->serial_number_published_ = true;  // stop requesting it; nothing left to retry
-  }
+  if (failed_state == ReadState::SERIAL_NUMBER)
+    this->note_serial_number_failure_();
 #endif
 #ifdef USE_BINARY_SENSOR
-  if (failed_state == ReadState::DG_SENSING && ++this->dg_sensing_failures_ >= MAX_OPTIONAL_READ_FAILURES) {
-    ESP_LOGW(TAG, "DG sensing read failed %u times in a row, giving up", this->dg_sensing_failures_);
-    this->dg_sensing_disabled_ = true;
-  }
+  if (failed_state == ReadState::DG_SENSING)
+    this->note_dg_sensing_failure_();
 #endif
   this->start_read_(this->next_read_state_after_(failed_state));
 }
@@ -138,11 +148,19 @@ void SelecMeter::on_not_sent(std::span<const uint8_t> request_pdu) {
 }
 
 #ifdef USE_TEXT_SENSOR
+void SelecMeter::note_serial_number_failure_() {
+  if (++this->serial_number_failures_ >= MAX_OPTIONAL_READ_FAILURES) {
+    ESP_LOGW(TAG, "Serial number read failed %u times in a row, giving up", this->serial_number_failures_);
+    this->serial_number_disabled_ = true;
+  }
+}
+
 void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
   if (this->serial_number_sensor_ == nullptr)
     return;
   if (data.size() < 4) {
     ESP_LOGW(TAG, "Short response for serial number: %zu bytes", data.size());
+    this->note_serial_number_failure_();
     return;
   }
   uint32_t serial = this->word_swap_ ? encode_uint32(data[2], data[3], data[0], data[1])
@@ -156,16 +174,25 @@ void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
 #endif
 
 #ifdef USE_BINARY_SENSOR
+void SelecMeter::note_dg_sensing_failure_() {
+  if (++this->dg_sensing_failures_ >= MAX_OPTIONAL_READ_FAILURES) {
+    ESP_LOGW(TAG, "DG sensing read failed %u times in a row, giving up", this->dg_sensing_failures_);
+    this->dg_sensing_disabled_ = true;
+  }
+}
+
 void SelecMeter::decode_dg_sensing_(std::span<const uint8_t> data) {
   if (this->dg_sensing_sensor_ == nullptr)
     return;
   if (data.size() < 4) {
     ESP_LOGW(TAG, "Short response for DG sensing: %zu bytes", data.size());
+    this->note_dg_sensing_failure_();
     return;
   }
   float value = decode_float(data, 0, NO_DEC_UNIT, this->word_swap_);
   if (!std::isfinite(value)) {
     ESP_LOGW(TAG, "Non-finite DG sensing value, ignoring");
+    this->note_dg_sensing_failure_();
     return;
   }
   this->dg_sensing_sensor_->publish_state(value != 0);
@@ -173,10 +200,10 @@ void SelecMeter::decode_dg_sensing_(std::span<const uint8_t> data) {
 }
 #endif
 
-void SelecMeter::decode_em2m_(std::span<const uint8_t> data) {
+bool SelecMeter::decode_em2m_(std::span<const uint8_t> data) {
   if (data.size() < EM2M_REGISTER_COUNT * 2) {
-    ESP_LOGW(TAG, "Invalid size for SelecMeter!");
-    return;
+    ESP_LOGW(TAG, "Invalid size for SelecMeter: expected %u bytes, got %zu", EM2M_REGISTER_COUNT * 2, data.size());
+    return false;
   }
 
   auto selec_meter_get_float = [&](size_t i, float unit) -> float {
@@ -238,12 +265,13 @@ void SelecMeter::decode_em2m_(std::span<const uint8_t> data) {
     this->maximum_demand_reactive_power_sensor_->publish_state(maximum_demand_reactive_power);
   if (this->maximum_demand_apparent_power_sensor_ != nullptr)
     this->maximum_demand_apparent_power_sensor_->publish_state(maximum_demand_apparent_power);
+  return true;
 }
 
-void SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
+bool SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
   if (data.size() < EM4M_REGISTER_COUNT * 2) {
-    ESP_LOGW(TAG, "Invalid size for SelecMeter!");
-    return;
+    ESP_LOGW(TAG, "Invalid size for SelecMeter: expected %u bytes, got %zu", EM4M_REGISTER_COUNT * 2, data.size());
+    return false;
   }
 
   auto get_float = [&](size_t i, float unit) -> float { return decode_float(data, i, unit, this->word_swap_); };
@@ -371,6 +399,7 @@ void SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
     this->net_reactive_energy_dg_sensor_->publish_state(get_float(EM4M_NET_REACTIVE_ENERGY_DG * 2, NO_DEC_UNIT));
   if (this->net_apparent_energy_dg_sensor_ != nullptr)
     this->net_apparent_energy_dg_sensor_->publish_state(get_float(EM4M_NET_APPARENT_ENERGY_DG * 2, NO_DEC_UNIT));
+  return true;
 }
 
 void SelecMeter::update() {

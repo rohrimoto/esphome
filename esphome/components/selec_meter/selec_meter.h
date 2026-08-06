@@ -121,13 +121,17 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   void dump_config() override;
 
  protected:
-  void decode_em2m_(std::span<const uint8_t> data);
-  void decode_em4m_(std::span<const uint8_t> data);
+  // Returns false (and publishes nothing) on a malformed payload; drives status_set_warning()/
+  // status_clear_warning() in on_response() so component health tracks the main block specifically.
+  bool decode_em2m_(std::span<const uint8_t> data);
+  bool decode_em4m_(std::span<const uint8_t> data);
 #ifdef USE_TEXT_SENSOR
   void decode_serial_number_(std::span<const uint8_t> data);
+  void note_serial_number_failure_();
 #endif
 #ifdef USE_BINARY_SENSOR
   void decode_dg_sensing_(std::span<const uint8_t> data);
+  void note_dg_sensing_failure_();
 #endif
   ReadState next_read_state_after_main_block_();
   // Advances the state machine from `current`, whether it just succeeded or failed -- a bad
@@ -138,8 +142,10 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
   // called directly from update() and, after decoding, from on_response()/fail_current_read_() --
   // no deferral through loop() is needed.
   void start_read_(ReadState state);
-  // Clears waiting_for_response_, marks the component unhealthy, and advances to the next read in
-  // the chain. Shared by on_error()/on_no_response()/on_not_sent() and a refused send in start_read_().
+  // Clears waiting_for_response_ and advances to the next read in the chain. Only marks the component
+  // unhealthy for a MAIN_BLOCK failure -- an optional side read (serial number/DG sensing) that the
+  // meter simply doesn't support shouldn't flip an otherwise-healthy meter into a warning state.
+  // Shared by on_error()/on_no_response()/on_not_sent() and a refused send in start_read_().
   void fail_current_read_(const char *reason);
 
   Model model_{Model::EM2M};
@@ -150,6 +156,7 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *serial_number_sensor_{nullptr};
   bool serial_number_published_{false};
+  bool serial_number_disabled_{false};
   uint8_t serial_number_failures_{0};
 #endif
 #ifdef USE_BINARY_SENSOR

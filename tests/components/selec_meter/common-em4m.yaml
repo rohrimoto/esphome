@@ -2,6 +2,7 @@ sensor:
   - platform: selec_meter
     modbus_id: modbus_bus
     model: em4m
+    byte_order: lsrf
     voltage_l1:
       name: SelecEM4M Voltage L1
     voltage_l2:
