@@ -60,7 +60,7 @@ ReadState SelecMeter::next_read_state_after_(ReadState current) {
     case ReadState::SERIAL_NUMBER:
 #ifdef USE_BINARY_SENSOR
       return (this->dg_sensing_sensor_ != nullptr && !this->dg_sensing_disabled_) ? ReadState::DG_SENSING
-                                                                                   : ReadState::IDLE;
+                                                                                  : ReadState::IDLE;
 #else
       return ReadState::IDLE;
 #endif
@@ -375,8 +375,7 @@ void SelecMeter::decode_em4m_(std::span<const uint8_t> data) {
 
 void SelecMeter::update() {
   if (this->waiting_for_response_ || this->read_state_ != ReadState::IDLE) {
-    ESP_LOGD(TAG, "Skipping update: previous read cycle (%s) still in progress",
-             read_state_name(this->read_state_));
+    ESP_LOGD(TAG, "Skipping update: previous read cycle (%s) still in progress", read_state_name(this->read_state_));
     return;
   }
   this->start_read_(ReadState::MAIN_BLOCK);
