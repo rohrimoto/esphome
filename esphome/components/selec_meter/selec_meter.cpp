@@ -14,6 +14,10 @@ static const char *const TAG = "selec_meter";
 
 static const uint8_t EM2M_REGISTER_COUNT = 34;  // 34 x 16-bit registers
 
+// Consecutive modbus-level failures (error/no-response/not-sent/refused) an optional extra read
+// tolerates before it's given up on for good, instead of being retried silently forever.
+static const uint8_t MAX_OPTIONAL_READ_FAILURES = 5;
+
 static const char *read_state_name(ReadState state) {
   switch (state) {
     case ReadState::MAIN_BLOCK:
@@ -43,7 +47,7 @@ ReadState SelecMeter::next_read_state_after_main_block_() {
     return ReadState::SERIAL_NUMBER;
 #endif
 #ifdef USE_BINARY_SENSOR
-  if (this->dg_sensing_sensor_ != nullptr)
+  if (this->dg_sensing_sensor_ != nullptr && !this->dg_sensing_disabled_)
     return ReadState::DG_SENSING;
 #endif
   return ReadState::IDLE;
@@ -55,7 +59,8 @@ ReadState SelecMeter::next_read_state_after_(ReadState current) {
       return this->next_read_state_after_main_block_();
     case ReadState::SERIAL_NUMBER:
 #ifdef USE_BINARY_SENSOR
-      return this->dg_sensing_sensor_ != nullptr ? ReadState::DG_SENSING : ReadState::IDLE;
+      return (this->dg_sensing_sensor_ != nullptr && !this->dg_sensing_disabled_) ? ReadState::DG_SENSING
+                                                                                   : ReadState::IDLE;
 #else
       return ReadState::IDLE;
 #endif
@@ -90,6 +95,7 @@ void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<con
 #endif
       break;
     case ReadState::IDLE:
+      ESP_LOGW(TAG, "Unexpected response while idle, dropping");
       break;
   }
   this->read_state_ = this->next_read_state_after_(current);
@@ -98,10 +104,23 @@ void SelecMeter::on_response(std::span<const uint8_t> request_pdu, std::span<con
 }
 
 void SelecMeter::fail_current_read_(const char *reason) {
-  ESP_LOGW(TAG, "%s while reading %s", reason, read_state_name(this->read_state_));
+  ReadState failed_state = this->read_state_;
+  ESP_LOGW(TAG, "%s while reading %s", reason, read_state_name(failed_state));
   this->status_set_warning();
   this->waiting_for_response_ = false;
-  this->read_state_ = this->next_read_state_after_(this->read_state_);
+#ifdef USE_TEXT_SENSOR
+  if (failed_state == ReadState::SERIAL_NUMBER && ++this->serial_number_failures_ >= MAX_OPTIONAL_READ_FAILURES) {
+    ESP_LOGW(TAG, "Serial number read failed %u times in a row, giving up", this->serial_number_failures_);
+    this->serial_number_published_ = true;  // stop requesting it; nothing left to retry
+  }
+#endif
+#ifdef USE_BINARY_SENSOR
+  if (failed_state == ReadState::DG_SENSING && ++this->dg_sensing_failures_ >= MAX_OPTIONAL_READ_FAILURES) {
+    ESP_LOGW(TAG, "DG sensing read failed %u times in a row, giving up", this->dg_sensing_failures_);
+    this->dg_sensing_disabled_ = true;
+  }
+#endif
+  this->read_state_ = this->next_read_state_after_(failed_state);
   if (this->read_state_ == ReadState::IDLE)
     this->disable_loop();
 }
@@ -135,6 +154,7 @@ void SelecMeter::decode_serial_number_(std::span<const uint8_t> data) {
   snprintf(buf, sizeof(buf), "%08" PRIX32, serial);
   this->serial_number_sensor_->publish_state(buf);
   this->serial_number_published_ = true;
+  this->serial_number_failures_ = 0;
 }
 #endif
 
@@ -152,6 +172,7 @@ void SelecMeter::decode_dg_sensing_(std::span<const uint8_t> data) {
     return;
   }
   this->dg_sensing_sensor_->publish_state(value != 0);
+  this->dg_sensing_failures_ = 0;
 }
 #endif
 
@@ -361,8 +382,11 @@ void SelecMeter::setup() {
 }
 
 void SelecMeter::update() {
-  if (this->waiting_for_response_ || this->read_state_ != ReadState::IDLE)
+  if (this->waiting_for_response_ || this->read_state_ != ReadState::IDLE) {
+    ESP_LOGD(TAG, "Skipping update: previous read cycle (%s) still in progress",
+             read_state_name(this->read_state_));
     return;
+  }
   this->read_state_ = ReadState::MAIN_BLOCK;
   this->enable_loop();
 }

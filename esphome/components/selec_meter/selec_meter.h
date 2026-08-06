@@ -148,9 +148,12 @@ class SelecMeter final : public PollingComponent, public modbus::ModbusClientDev
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *serial_number_sensor_{nullptr};
   bool serial_number_published_{false};
+  uint8_t serial_number_failures_{0};
 #endif
 #ifdef USE_BINARY_SENSOR
   binary_sensor::BinarySensor *dg_sensing_sensor_{nullptr};
+  uint8_t dg_sensing_failures_{0};
+  bool dg_sensing_disabled_{false};
 #endif
 };
 
