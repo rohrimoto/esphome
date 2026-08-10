@@ -5,10 +5,11 @@
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/uart/uart.h"
 #include "mitsubishi_cn105.h"
+#include "mitsubishi_cn105_swing_mode_manager.h"
 
 namespace esphome::mitsubishi_cn105 {
 
-class MitsubishiCN105Climate : public climate::Climate, public Component, public uart::UARTDevice {
+class MitsubishiCN105Climate final : public climate::Climate, public Component, public uart::UARTDevice {
  public:
   explicit MitsubishiCN105Climate() : hp_(*this) {}
 
@@ -31,13 +32,11 @@ class MitsubishiCN105Climate : public climate::Climate, public Component, public
   void apply_values_();
 
   MitsubishiCN105 hp_;
-  climate::ClimateSwingModeMask supported_swing_modes_{};
-  MitsubishiCN105::VaneMode last_non_swing_vane_mode_{MitsubishiCN105::VaneMode::AUTO};
-  MitsubishiCN105::WideVaneMode last_non_swing_wide_vane_mode_{MitsubishiCN105::WideVaneMode::CENTER};
+  SwingModeManager swing_mode_manager_;
 };
 
 template<typename... Ts>
-class SetRemoteTemperatureAction : public Action<Ts...>, public Parented<MitsubishiCN105Climate> {
+class SetRemoteTemperatureAction final : public Action<Ts...>, public Parented<MitsubishiCN105Climate> {
  public:
   TEMPLATABLE_VALUE(float, temperature)
 
@@ -45,7 +44,7 @@ class SetRemoteTemperatureAction : public Action<Ts...>, public Parented<Mitsubi
 };
 
 template<typename... Ts>
-class ClearRemoteTemperatureAction : public Action<Ts...>, public Parented<MitsubishiCN105Climate> {
+class ClearRemoteTemperatureAction final : public Action<Ts...>, public Parented<MitsubishiCN105Climate> {
  public:
   void play(const Ts &...x) override { this->parent_->clear_remote_temperature(); }
 };
