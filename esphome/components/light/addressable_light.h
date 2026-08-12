@@ -31,6 +31,19 @@ class AddressableLight : public LightOutput, public Component {
   ESPColorView operator[](int32_t index) const { return this->get_view_internal(interpret_index(index, this->size())); }
   ESPColorView get(int32_t index) { return this->get_view_internal(interpret_index(index, this->size())); }
   virtual void clear_effect_data() = 0;
+
+#ifdef USE_CURRENT_LIMITING
+  void set_current_limits(float max, float red_per_led, float green_per_led, float blue_per_led,
+                          float white_per_led = 0.0f);
+  float get_current_consumption() const;
+  float get_current_utilization() const;  // Returns 0.0 to 1.0
+  bool is_current_limited() const;
+  void set_current_limiting_enabled(bool enabled) { this->current_limiting_enabled_ = enabled; }
+  bool is_current_limiting_enabled() const { return this->current_limiting_enabled_; }
+
+  void apply_current_limiting();
+#endif
+
   ESPRangeView range(int32_t from, int32_t to) {
     from = interpret_index(from, this->size());
     to = interpret_index(to, this->size());
@@ -96,12 +109,36 @@ class AddressableLight : public LightOutput, public Component {
   }
   virtual ESPColorView get_view_internal(int32_t index) const = 0;
 
+#ifdef USE_CURRENT_LIMITING
+  bool supports_current_management() const override { return true; }
+#else
+  bool supports_current_management() const override { return false; }
+#endif
+
+  float calculate_total_current_from_buffer_();
+  void scale_all_leds_in_buffer_(float scale_factor);
+
   ESPColorCorrection correction_{};
   LightState *state_parent_{nullptr};
 #ifdef USE_POWER_SUPPLY
   power_supply::PowerSupplyRequester power_;
 #endif
   bool effect_active_{false};
+
+#ifdef USE_CURRENT_LIMITING
+  float current_consumption_ = 0.0f;
+  bool current_limiting_active_ = false;
+  bool current_limiting_enabled_ = true;
+
+  // Current management data
+  struct CurrentLimits {
+    float max = 0.0f;           // 0 = disabled
+    float red_per_led = 0.02f;  // Default 20mA per LED at full brightness
+    float green_per_led = 0.02f;
+    float blue_per_led = 0.02f;
+    float white_per_led = 0.02f;
+  } current_limits_;
+#endif
 };
 
 class AddressableLightTransformer : public LightTransformer {

@@ -5,6 +5,7 @@
 #include "esphome/core/log.h"
 #include "light_output.h"
 #include "transformers.h"
+#include "addressable_light.h"
 
 namespace esphome::light {
 
@@ -151,6 +152,14 @@ void LightState::loop() {
   // Write state to the light
   if (this->next_write_) {
     this->next_write_ = false;
+
+    // Apply current limiting for lights that support it
+#ifdef USE_CURRENT_LIMITING
+    if (this->output_->supports_current_management()) {
+      auto *addressable_light = static_cast<light::AddressableLight *>(this->output_);
+      addressable_light->apply_current_limiting();
+    }
+#endif
     this->output_->write_state(this);
     // Disable loop if idle (no transformer and no effect)
     this->disable_loop_if_idle_();

@@ -162,4 +162,73 @@ optional<LightColorValues> AddressableLightTransformer::apply() {
   return {};
 }
 
+#ifdef USE_CURRENT_LIMITING
+// Current management implementations
+void AddressableLight::set_current_limits(float max, float red_per_led, float green_per_led, float blue_per_led,
+                                          float white_per_led) {
+  this->current_limits_.max = max;
+  this->current_limits_.red_per_led = red_per_led;
+  this->current_limits_.green_per_led = green_per_led;
+  this->current_limits_.blue_per_led = blue_per_led;
+  this->current_limits_.white_per_led = white_per_led;
+}
+
+float AddressableLight::get_current_consumption() const { return this->current_consumption_; }
+
+float AddressableLight::get_current_utilization() const {
+  if (this->current_limits_.max <= 0.0f) {
+    return 0.0f;
+  }
+  return this->current_consumption_ / this->current_limits_.max;
+}
+
+bool AddressableLight::is_current_limited() const { return this->current_limiting_active_; }
+#endif
+
+#ifdef USE_CURRENT_LIMITING
+float AddressableLight::calculate_total_current_from_buffer_() {
+  float total_current = 0.0f;
+
+  for (int i = 0; i < this->size(); i++) {
+    auto view = this->get_view_internal(i);
+    Color color = view.get();
+
+    // Calculate current for this LED using configured values
+    float red_current = (color.r / 255.0f) * this->current_limits_.red_per_led;
+    float green_current = (color.g / 255.0f) * this->current_limits_.green_per_led;
+    float blue_current = (color.b / 255.0f) * this->current_limits_.blue_per_led;
+    float white_current = (color.w / 255.0f) * this->current_limits_.white_per_led;
+
+    total_current += red_current + green_current + blue_current + white_current;
+  }
+
+  return total_current;
+}
+#endif
+
+void AddressableLight::scale_all_leds_in_buffer_(float scale_factor) {
+  for (int i = 0; i < this->size(); i++) {
+    auto view = this->get_view_internal(i);
+    Color color = view.get();
+
+    Color scaled = Color((uint8_t) (color.r * scale_factor), (uint8_t) (color.g * scale_factor),
+                         (uint8_t) (color.b * scale_factor), (uint8_t) (color.w * scale_factor));
+
+    view.set(scaled);
+  }
+}
+
+#ifdef USE_CURRENT_LIMITING
+void AddressableLight::apply_current_limiting() {
+  if (this->current_limiting_enabled_ && this->current_limits_.max > 0.0f) {
+    float total_current = this->calculate_total_current_from_buffer_();
+
+    if (total_current > this->current_limits_.max) {
+      float scale_factor = this->current_limits_.max / total_current;
+      this->scale_all_leds_in_buffer_(scale_factor);
+    }
+  }
+}
+#endif
+
 }  // namespace esphome::light
