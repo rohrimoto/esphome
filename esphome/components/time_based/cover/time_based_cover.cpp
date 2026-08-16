@@ -60,6 +60,10 @@ CoverTraits TimeBasedCover::get_traits() {
   return traits;
 }
 void TimeBasedCover::control(const CoverCall &call) {
+  if (this->is_external_override_) {
+    ESP_LOGW(TAG, "External manual control active. Ignoring Home Assistant command.");
+    return;
+  }
   if (call.get_stop()) {
     this->start_direction_(COVER_OPERATION_IDLE);
     this->publish_state();
@@ -180,6 +184,41 @@ void TimeBasedCover::recompute_position_() {
   this->position = clamp(this->position, 0.0f, 1.0f);
 
   this->last_recompute_time_ = now;
+}
+
+void TimeBasedCover::update_external_state(bool up_active, bool down_active) {
+  this->is_external_override_ = (up_active || down_active);
+
+  cover::CoverOperation desired_op = COVER_OPERATION_IDLE;
+  if (up_active && !down_active) {
+    desired_op = COVER_OPERATION_OPENING;
+  } else if (!up_active && down_active) {
+    desired_op = COVER_OPERATION_CLOSING;
+  }
+
+  if (this->current_operation == desired_op)
+    return;
+
+  this->recompute_position_();
+
+  if (this->prev_command_trigger_ != nullptr) {
+    this->stop_prev_trigger_();
+    this->stop_trigger_.trigger();
+  }
+
+  this->current_operation = desired_op;
+
+  if (desired_op != COVER_OPERATION_IDLE) {
+    this->last_operation_ = desired_op;
+    this->target_position_ = (desired_op == COVER_OPERATION_OPENING) ? COVER_OPEN : COVER_CLOSED;
+  }
+
+  const uint32_t now = millis();
+  this->start_dir_time_ = now;
+  this->last_recompute_time_ = now;
+  this->last_publish_time_ = now;
+
+  this->publish_state();
 }
 
 }  // namespace esphome::time_based

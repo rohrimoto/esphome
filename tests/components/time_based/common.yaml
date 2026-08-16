@@ -10,3 +10,13 @@ cover:
     close_action:
       - logger.log: close_action
     close_duration: 4.5min
+
+button:
+  - platform: template
+    name: Time Based Cover Lambda
+    on_press:
+      - lambda: |-
+          id(time_based_cover).update_external_state(true, false);
+          id(time_based_cover).update_external_state(false, true);
+          id(time_based_cover).update_external_state(true, true);
+          id(time_based_cover).update_external_state(false, false);

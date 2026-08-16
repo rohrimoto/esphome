@@ -22,8 +22,10 @@ class TimeBasedCover final : public cover::Cover, public Component {
   void set_manual_control(bool value) { this->manual_control_ = value; }
   void set_assumed_state(bool value) { this->assumed_state_ = value; }
   cover::CoverOperation get_last_operation() const { return this->last_operation_; }
+  void update_external_state(bool up_active, bool down_active);
 
  protected:
+  bool is_external_override_{false};
   void control(const cover::CoverCall &call) override;
   void stop_prev_trigger_();
   bool is_at_target_() const;
