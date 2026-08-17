@@ -992,6 +992,72 @@ class WaveshareEPaper7P5InV2P : public WaveshareEPaper {
   void turn_on_display_();
 };
 
+// 4-level grayscale mode of the 7.50inv2 (UC8179). Port of Waveshare's
+// EPD_7IN5_V2_Init_4Gray / Display_4Gray (panels made after 2023-10-24).
+// 2 bpp framebuffer. HYBRID refresh: every full_update_every-th update is a
+// true 4-gray full refresh; the updates between are quiet 1-bit partials that
+// drive only black/white transitions — gray pixels are encoded to match the
+// controller's old RAM (no-op waveform) so they physically persist between
+// fulls. Ink semantics match the 1-bit classes: COLOR_ON draws black,
+// COLOR_OFF is white; Color(85,85,85) light gray, Color(170,170,170) dark
+// gray (2-bit ink level = luminance >> 6).
+class WaveshareEPaper7P5InV2G4 : public WaveshareEPaperBase {
+ public:
+  bool wait_until_idle_();
+
+  void initialize() override;
+
+  void display() override;
+
+  void dump_config() override;
+
+  void fill(Color color) override;
+
+  void set_full_update_every(uint32_t full_update_every) { this->full_update_every_ = full_update_every; }
+
+  display::DisplayType get_display_type() override { return display::DisplayType::DISPLAY_TYPE_GRAYSCALE; }
+
+  void deep_sleep() override {
+    // COMMAND POWER OFF
+    this->command(0x02);
+    this->wait_until_idle_();
+    // COMMAND DEEP SLEEP
+    this->command(0x07);
+    this->data(0xA5);  // check byte
+  }
+
+ protected:
+  void draw_absolute_pixel_internal(int x, int y, Color color) override;
+
+  uint32_t get_buffer_length_() override;
+
+  int get_width_internal() override;
+
+  int get_height_internal() override;
+
+  uint32_t idle_timeout_() override;
+
+  uint32_t full_update_every_{1};
+  uint32_t at_update_{0};
+
+ private:
+  void reset_();
+
+  void turn_on_display_();
+
+  void send_plane_(uint8_t cmd, const uint8_t bit_for_ink[4]);
+
+  void send_lut_(uint8_t cmd, const uint8_t *lut);
+
+  uint8_t pack_whiteness_(uint32_t i);
+
+  // Whiteness bit-plane of the previously displayed frame (48 KB, PSRAM).
+  // Partials send DTM1=previous / DTM2=current so unchanged pixels land in
+  // the custom no-op WW/KK LUT slots — including grays, which therefore HOLD
+  // their physical level through partials.
+  uint8_t *prev_plane_{nullptr};
+};
+
 class WaveshareEPaper7P5InHDB : public WaveshareEPaper {
  public:
   void initialize() override;

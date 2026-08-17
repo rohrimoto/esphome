@@ -4358,6 +4358,288 @@ void WaveshareEPaper7P5InV2P::set_full_update_every(uint32_t full_update_every) 
   this->full_update_every_ = full_update_every;
 }
 
+// ========================================================
+//    7.50inv2 4-GRAY (UC8179) — WaveshareEPaper7P5InV2G4
+// Port of Waveshare EPD_7in5_V2.c Init_4Gray/Display_4Gray.
+// Buffer stores 2-bit INK per pixel (0=white .. 3=black),
+// 4 px/byte MSB-first. The controller wants two bit-planes
+// (0x10 and 0x13); per Waveshare's table the plane bits by
+// ink level are 0x10: {0,0,1,1} and 0x13: {0,1,0,1}.
+// ========================================================
+bool WaveshareEPaper7P5InV2G4::wait_until_idle_() {
+  if (this->busy_pin_ == nullptr) {
+    return true;
+  }
+  const uint32_t start = millis();
+  while (this->busy_pin_->digital_read()) {
+    this->command(0x71);
+    if (millis() - start > this->idle_timeout_()) {
+      ESP_LOGE(TAG, "Timeout while displaying image!");
+      return false;
+    }
+    App.feed_wdt();
+    delay(10);
+  }
+  return true;
+}
+
+void WaveshareEPaper7P5InV2G4::reset_() {
+  if (this->reset_pin_ != nullptr) {
+    this->reset_pin_->digital_write(true);
+    delay(20);
+    this->reset_pin_->digital_write(false);
+    delay(2);
+    this->reset_pin_->digital_write(true);
+    delay(20);
+  }
+}
+
+void WaveshareEPaper7P5InV2G4::turn_on_display_() {
+  this->command(0x12);
+  delay(100);  // NOLINT
+  this->wait_until_idle_();
+}
+
+// Custom register LUTs for TRUE differential partials (10 groups x
+// [VS, TP0..TP3, RP]; only group 0 used). The OTP fast waveform (E5=6E)
+// drives EVERY pixel toward DTM2, so grays could not survive partials.
+// These LUTs give WW/KK genuine no-op slots (all-zero waveform): only
+// K->W / W->K transitions get driven, ~25+1 frames, phase VS 10b=VDL
+// (toward white) / 01b=VDH (toward black). Grays sit in WW/KK -> held.
+static const uint8_t V2G4_LUT_VCOM[60] = {0x00, 0x19, 0x01, 0x00, 0x00, 0x01};
+static const uint8_t V2G4_LUT_ZERO[60] = {0x00};  // WW / KK / border: no-op
+static const uint8_t V2G4_LUT_KW[60] = {0x80, 0x19, 0x01, 0x00, 0x00, 0x01};
+static const uint8_t V2G4_LUT_WK[60] = {0x40, 0x19, 0x01, 0x00, 0x00, 0x01};
+
+void WaveshareEPaper7P5InV2G4::send_lut_(uint8_t cmd, const uint8_t *lut) {
+  this->command(cmd);
+  for (int i = 0; i < 60; i++)
+    this->data(lut[i]);
+}
+
+void WaveshareEPaper7P5InV2G4::initialize() {
+  this->reset_();
+
+  // COMMAND POWER SETTING — define VGH/VGL 20V, VDH/VDL 15V (the register
+  // LUTs drive with these; the OTP 4-gray path uses them too)
+  this->command(0x01);
+  this->data(0x07);
+  this->data(0x07);
+  this->data(0x3F);
+  this->data(0x3F);
+
+  // COMMAND PANEL SETTING — KW mode, LUT from OTP
+  this->command(0x00);
+  this->data(0x1F);
+
+  // COMMAND VCOM AND DATA INTERVAL SETTING
+  this->command(0x50);
+  this->data(0x10);
+  this->data(0x07);
+
+  // COMMAND POWER ON
+  this->command(0x04);
+  delay(100);  // NOLINT
+  this->wait_until_idle_();
+
+  // COMMAND BOOSTER SOFT START
+  this->command(0x06);
+  this->data(0x27);
+  this->data(0x27);
+  this->data(0x18);
+  this->data(0x17);
+
+  // 4-gray waveform select (the whole trick: E0=02 + E5=5F)
+  this->command(0xE0);
+  this->data(0x02);
+  this->command(0xE5);
+  this->data(0x5F);
+
+  // Upload the partial-refresh register LUTs once; they persist through
+  // power-off (only deep sleep loses them) and are activated per-update by
+  // flipping PANEL SETTING to 0x3F (LUT from register).
+  this->send_lut_(0x20, V2G4_LUT_VCOM);
+  this->send_lut_(0x21, V2G4_LUT_ZERO);  // WW: no-op
+  this->send_lut_(0x22, V2G4_LUT_KW);
+  this->send_lut_(0x23, V2G4_LUT_WK);
+  this->send_lut_(0x24, V2G4_LUT_ZERO);  // KK: no-op
+  this->send_lut_(0x25, V2G4_LUT_ZERO);  // border: no-op
+
+  // COMMAND POWER OFF until the first display()
+  this->command(0x02);
+}
+
+uint8_t WaveshareEPaper7P5InV2G4::pack_whiteness_(uint32_t i) {
+  // 8 pixels (2 buffer bytes) -> whiteness byte, MSB-first; 1 = white-ish
+  static const uint8_t WHITE_BIT[4] = {1, 1, 0, 0};
+  uint8_t out = 0;
+  for (uint32_t j = 0; j < 2; j++) {
+    uint8_t b = this->buffer_[i + j];
+    for (int k = 3; k >= 0; k--) {
+      out = (out << 1) | WHITE_BIT[(b >> (2 * k)) & 0x3];
+    }
+  }
+  return out;
+}
+
+void WaveshareEPaper7P5InV2G4::send_plane_(uint8_t cmd, const uint8_t bit_for_ink[4]) {
+  uint32_t buf_len = this->get_buffer_length_();
+  this->command(cmd);
+  delay(2);
+  // 8 pixels = 2 buffer bytes -> 1 wire byte, MSB-first
+  for (uint32_t i = 0; i < buf_len; i += 2) {
+    uint8_t out = 0;
+    for (uint32_t j = 0; j < 2; j++) {
+      uint8_t b = this->buffer_[i + j];
+      for (int k = 3; k >= 0; k--) {
+        uint8_t ink = (b >> (2 * k)) & 0x3;
+        out = (out << 1) | bit_for_ink[ink];
+      }
+    }
+    this->data(out);
+    if ((i & 0x3FF) == 0) {
+      App.feed_wdt();
+    }
+  }
+}
+
+void HOT WaveshareEPaper7P5InV2G4::display() {
+  static const uint8_t PLANE10[4] = {0, 0, 1, 1};
+  static const uint8_t PLANE13[4] = {0, 1, 0, 1};
+
+  uint32_t buf_len = this->get_buffer_length_();
+  uint32_t plane_len = buf_len / 2;
+
+  if (this->prev_plane_ == nullptr) {
+    RAMAllocator<uint8_t> allocator;
+    this->prev_plane_ = allocator.allocate(plane_len);
+    if (this->prev_plane_ == nullptr) {
+      ESP_LOGE(TAG, "Could not allocate prev-plane buffer; forcing full refreshes");
+      this->full_update_every_ = 1;
+    }
+  }
+
+  // COMMAND POWER ON
+  this->command(0x04);
+  delay(100);  // NOLINT
+  this->wait_until_idle_();
+
+  if (this->at_update_ == 0 || this->prev_plane_ == nullptr) {
+    // FULL: true 4-gray redraw via the OTP waveform (restores grays, clears
+    // ghosting). PANEL SETTING back to OTP LUTs for this pass.
+    this->command(0x92);  // partial out
+    this->command(0x00);
+    this->data(0x1F);
+    this->command(0x50);
+    this->data(0x10);
+    this->data(0x07);
+    this->command(0xE5);
+    this->data(0x5F);
+
+    this->send_plane_(0x10, PLANE10);
+    this->send_plane_(0x13, PLANE13);
+
+    this->turn_on_display_();
+  } else {
+    // PARTIAL (rev 4): TRUE differential using our register LUTs. WW/KK are
+    // no-op waveforms, so any pixel whose whiteness bit didn't change —
+    // including every unchanged GRAY — is left physically alone; only
+    // K<->W transitions get driven. DTM1 = previous frame, DTM2 = current.
+    this->command(0x00);
+    this->data(0x3F);  // KW mode, LUT from REGISTER
+    this->command(0x50);
+    this->data(0xA9);
+    this->data(0x07);
+
+    // Partial in + full-screen window
+    this->command(0x91);
+    this->command(0x90);
+    this->data(0x00);
+    this->data(0x00);
+    this->data((this->get_width_internal() - 1) >> 8 & 0xFF);
+    this->data((this->get_width_internal() - 1) & 0xFF);
+    this->data(0x00);
+    this->data(0x00);
+    this->data((this->get_height_internal() - 1) >> 8 & 0xFF);
+    this->data((this->get_height_internal() - 1) & 0xFF);
+    this->data(0x01);
+
+    // old frame
+    this->command(0x10);
+    delay(2);
+    for (uint32_t i = 0; i < plane_len; i++) {
+      this->data(this->prev_plane_[i]);
+      if ((i & 0x3FF) == 0)
+        App.feed_wdt();
+    }
+    // new frame (stored as it streams — becomes "old" for the next partial)
+    this->command(0x13);
+    delay(2);
+    for (uint32_t i = 0; i < buf_len; i += 2) {
+      uint8_t w = this->pack_whiteness_(i);
+      this->prev_plane_[i >> 1] = w;
+      this->data(w);
+      if ((i & 0x7FF) == 0)
+        App.feed_wdt();
+    }
+
+    this->turn_on_display_();
+    this->command(0x92);  // partial out
+  }
+
+  // Keep the prev plane in sync after a FULL pass too, so the first partial
+  // after it diffs against reality.
+  if (this->at_update_ == 0 && this->prev_plane_ != nullptr) {
+    for (uint32_t i = 0; i < buf_len; i += 2) {
+      this->prev_plane_[i >> 1] = this->pack_whiteness_(i);
+    }
+  }
+
+  // COMMAND POWER OFF
+  this->command(0x02);
+  this->wait_until_idle_();
+
+  this->at_update_ = (this->at_update_ + 1) % this->full_update_every_;
+}
+
+void WaveshareEPaper7P5InV2G4::fill(Color color) {
+  uint8_t lum = (color.red + color.green + color.blue) / 3;
+  uint8_t ink = lum >> 6;
+  uint8_t byte = (ink << 6) | (ink << 4) | (ink << 2) | ink;
+  memset(this->buffer_, byte, this->get_buffer_length_());
+}
+
+void HOT WaveshareEPaper7P5InV2G4::draw_absolute_pixel_internal(int x, int y, Color color) {
+  if (x >= this->get_width_internal() || y >= this->get_height_internal() || x < 0 || y < 0)
+    return;
+  uint8_t lum = (color.red + color.green + color.blue) / 3;
+  uint8_t ink = lum >> 6;
+  uint32_t pos = x + y * this->get_width_internal();
+  uint32_t byte_i = pos >> 2;
+  uint8_t shift = 6 - 2 * (pos & 0x3);
+  this->buffer_[byte_i] = (this->buffer_[byte_i] & ~(0x3 << shift)) | (ink << shift);
+}
+
+uint32_t WaveshareEPaper7P5InV2G4::get_buffer_length_() {
+  // 2 bpp
+  return this->get_width_internal() * this->get_height_internal() / 4u;
+}
+
+int WaveshareEPaper7P5InV2G4::get_width_internal() { return 800; }
+int WaveshareEPaper7P5InV2G4::get_height_internal() { return 480; }
+uint32_t WaveshareEPaper7P5InV2G4::idle_timeout_() { return 10000; }
+void WaveshareEPaper7P5InV2G4::dump_config() {
+  LOG_DISPLAY("", "Waveshare E-Paper", this);
+  ESP_LOGCONFIG(TAG,
+                "  Model: 7.50inv2-4gray\n"
+                "  Full Update Every: %" PRIu32,
+                this->full_update_every_);
+  LOG_PIN("  Reset Pin: ", this->reset_pin_);
+  LOG_PIN("  DC Pin: ", this->dc_pin_);
+  LOG_PIN("  Busy Pin: ", this->busy_pin_);
+  LOG_UPDATE_INTERVAL(this);
+}
+
 /* 7.50in-bc */
 void WaveshareEPaper7P5InBC::initialize() {
   /* The command sequence is similar to the 7P5In display but differs in subtle ways
