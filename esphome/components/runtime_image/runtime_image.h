@@ -34,8 +34,7 @@ constexpr MimeLookup MIME_LOOKUP_TABLE[] = {
     {"image/bmp", ImageFormat::BMP},
 #endif
 #ifdef USE_RUNTIME_IMAGE_JPEG
-    {"image/jpeg", ImageFormat::JPEG},
-    {"image/jpg", ImageFormat::JPEG},
+    {"image/jpeg", ImageFormat::JPEG}, {"image/jpg", ImageFormat::JPEG},
 #endif
 #ifdef USE_RUNTIME_IMAGE_PNG
     {"image/png", ImageFormat::PNG},
