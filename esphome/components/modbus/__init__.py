@@ -40,28 +40,49 @@ CONF_TURNAROUND_TIME = "turnaround_time"
 MODBUS_ROLES = ["client", "server"]
 
 
-def command_options_schema(*, direction: Literal["read", "write"]) -> dict:
+def command_options_schema(
+    *, direction: Literal["read", "write"], templatable: bool = False
+) -> dict:
     """Schema fragment for the per-command options a component forwards to the hub
-    (modbus::CommandOptions). Extend this into any schema that queues commands, then build
-    the matching C++ initializer with command_options_expression() using the same direction.
-    Keys are direction-specific so a schema never offers an option the hub would strip
-    (e.g. continuous on a write); the write side has no options yet.
+    (modbus::CommandOptions). Extend this into any schema that queues commands. Keys are
+    direction-specific so a schema never offers an option the hub would strip (e.g.
+    continuous on a write); the write side has no options yet.
+
+    With templatable=False the values are static: build the C++ initializer with
+    command_options_expression() using the same direction. With templatable=True the keys
+    also accept lambdas (for actions, where trigger arguments are in scope): the consumer's
+    C++ class declares a TEMPLATABLE_VALUE per option and assembles CommandOptions at play
+    time; register the values with register_templatable_command_options().
     """
     options = {}
     if direction == "read":
-        options[cv.Optional(CONF_CONTINUOUS, default=False)] = cv.boolean
+        validator = cv.templatable(cv.boolean) if templatable else cv.boolean
+        options[cv.Optional(CONF_CONTINUOUS, default=False)] = validator
     return options
 
 
 def command_options_expression(
     config: ConfigType, *, direction: Literal["read", "write"]
 ) -> cg.StructInitializer:
-    """Build the modbus::CommandOptions initializer for a config validated with
-    command_options_schema() of the same direction."""
+    """Build the modbus::CommandOptions initializer for a config validated with a static
+    (templatable=False) command_options_schema() of the same direction."""
     fields = []
     if direction == "read":
         fields.append(("continuous", config[CONF_CONTINUOUS]))
     return cg.StructInitializer(CommandOptions, *fields)
+
+
+async def register_templatable_command_options(
+    var, config: ConfigType, args: list, *, direction: Literal["read", "write"]
+) -> None:
+    """Generate the set_<option>() calls for a config validated with a templatable
+    command_options_schema() of the same direction. The consumer's C++ class declares a
+    matching TEMPLATABLE_VALUE per option (e.g. TEMPLATABLE_VALUE(bool, continuous)) and
+    builds the CommandOptions it sends by evaluating them with the trigger arguments.
+    """
+    if direction == "read":
+        template_ = await cg.templatable(config[CONF_CONTINUOUS], args, bool)
+        cg.add(var.set_continuous(template_))
 
 
 CONFIG_SCHEMA = cv.typed_schema(
