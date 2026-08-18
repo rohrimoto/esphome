@@ -67,7 +67,7 @@ class APINoiseFrameHelper final : public APIFrameHelper {
   // Fixed-size header buffer for noise protocol:
   // 1 byte for indicator + 2 bytes for message size (16-bit value, not varint)
   // Note: Maximum message size is UINT16_MAX (65535), with a limit of 128 bytes during handshake phase
-  uint8_t rx_header_buf_[3];
+  uint8_t rx_header_buf_[noise::FRAME_HEADER_SIZE];
   uint8_t rx_header_buf_len_ = 0;
   // 4 bytes total, no padding
 };
