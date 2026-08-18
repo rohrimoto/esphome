@@ -232,7 +232,7 @@ void ModbusController::update() {
         continue;
       }
       ESP_LOGVV(TAG, "Updating range 0x%X", cmd.register_address());
-      cmd.send({.continuous = this->continuous_});
+      cmd.send(this->read_options_);
     }
   }
   this->update_counter_++;
@@ -469,7 +469,7 @@ ModbusCommandItem ModbusCommandItem::create_custom_command(ModbusController *con
 
 bool ModbusCommandItem::send(modbus::CommandOptions options) {
   // Options pass straight through to the hub (which ignores continuous for writes). The polling loop in
-  // update() sets continuous from the controller's continuous mode; one-shot commands keep the default.
+  // update() passes the controller's read-side options; one-shot commands keep the default.
   bool accepted;
   if (this->custom_pdu_ != nullptr) {
     // Custom polling command: the ready-made PDU bytes live in the sensor.

@@ -7,9 +7,16 @@ from esphome import pins
 import esphome.codegen as cg
 from esphome.components import uart
 import esphome.config_validation as cv
-from esphome.const import CONF_ADDRESS, CONF_DISABLE_CRC, CONF_FLOW_CONTROL_PIN, CONF_ID
+from esphome.const import (
+    CONF_ADDRESS,
+    CONF_CONTINUOUS,
+    CONF_DISABLE_CRC,
+    CONF_FLOW_CONTROL_PIN,
+    CONF_ID,
+)
 from esphome.cpp_helpers import gpio_pin_expression
 import esphome.final_validate as fv
+from esphome.types import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +29,7 @@ ModbusClient = modbus_ns.class_("ModbusClientHub", Modbus)
 ModbusDevice = modbus_ns.class_("ModbusDevice")
 ModbusClientDevice = modbus_ns.class_("ModbusClientDevice")
 ModbusServerDevice = modbus_ns.class_("ModbusServerDevice")
+CommandOptions = modbus_ns.struct("CommandOptions")
 MULTI_CONF = True
 
 CONF_ROLE = "role"
@@ -30,6 +38,31 @@ CONF_SEND_WAIT_TIME = "send_wait_time"
 CONF_TURNAROUND_TIME = "turnaround_time"
 
 MODBUS_ROLES = ["client", "server"]
+
+
+def command_options_schema(*, direction: Literal["read", "write"]) -> dict:
+    """Schema fragment for the per-command options a component forwards to the hub
+    (modbus::CommandOptions). Extend this into any schema that queues commands, then build
+    the matching C++ initializer with command_options_expression() using the same direction.
+    Keys are direction-specific so a schema never offers an option the hub would strip
+    (e.g. continuous on a write); the write side has no options yet.
+    """
+    options = {}
+    if direction == "read":
+        options[cv.Optional(CONF_CONTINUOUS, default=False)] = cv.boolean
+    return options
+
+
+def command_options_expression(
+    config: ConfigType, *, direction: Literal["read", "write"]
+) -> cg.StructInitializer:
+    """Build the modbus::CommandOptions initializer for a config validated with
+    command_options_schema() of the same direction."""
+    fields = []
+    if direction == "read":
+        fields.append(("continuous", config[CONF_CONTINUOUS]))
+    return cg.StructInitializer(CommandOptions, *fields)
+
 
 CONFIG_SCHEMA = cv.typed_schema(
     {
