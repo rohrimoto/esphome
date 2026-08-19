@@ -518,11 +518,13 @@ def _build_config_struct(
     Fields must be added in declaration order (see hub75_types.h) to satisfy
     C++ designated initializer requirements. The order is:
       1. fields_before_pins (panel_width through layout)
-      2. rotation
-      3. pins
-      4. output_clock_speed
-      5. min_refresh_rate
-      6. fields_after_min_refresh (latch_blanking through brightness)
+      2. pins
+      3. output_clock_speed
+      4. min_refresh_rate
+      5. fields_after_min_refresh (latch_blanking through brightness)
+
+    rotation is intentionally omitted — HUB75Display::set_rotation() populates
+    config_.rotation before setup() constructs the driver.
     """
     fields_before_pins = [
         (CONF_PANEL_WIDTH, "panel_width"),
@@ -545,9 +547,9 @@ def _build_config_struct(
 
     _append_config_fields(config, fields_before_pins, config_fields)
 
-    # Rotation - config already contains Hub75Rotation enum from cv.enum
-    if CONF_ROTATION in config:
-        config_fields.append(("rotation", config[CONF_ROTATION]))
+    # Rotation is populated via the HUB75Display::set_rotation() override before setup()
+    # runs, so it doesn't need a struct field here — the default ROTATE_0 stays in place
+    # until set_rotation() updates config_.rotation.
 
     config_fields.append(("pins", pins_struct))
 
@@ -603,12 +605,17 @@ async def to_code(config: ConfigType) -> None:
     pins_struct = _build_pins_struct(pin_expressions, e_pin_num)
     hub75_config = _build_config_struct(config, pins_struct, min_refresh)
 
-    # Rotation is handled by the hub75 driver (config_.rotation already set above).
-    # Force rotation to 0 for ESPHome's Display base class to avoid double-rotation.
-    if CONF_ROTATION in config:
-        config[CONF_ROTATION] = 0
+    # Native (pre-rotation) virtual dimensions — what LVGL records as the display size.
+    width = config[CONF_PANEL_WIDTH] * config.get(CONF_LAYOUT_COLS, 1)
+    height = config[CONF_PANEL_HEIGHT] * config.get(CONF_LAYOUT_ROWS, 1)
+    display.add_metadata(
+        config[CONF_ID],
+        width,
+        height,
+        has_writer=CONF_LAMBDA in config,
+        has_hardware_rotation=True,
+    )
 
-    # Create display and register
     var = cg.new_Pvariable(config[CONF_ID], hub75_config)
     await display.register_display(var, config)
 

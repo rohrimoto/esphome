@@ -34,6 +34,8 @@ class HUB75Display final : public display::Display {
   void draw_pixels_at(int x_start, int y_start, int w, int h, const uint8_t *ptr, display::ColorOrder order,
                       display::ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) override;
 
+  void set_rotation(display::DisplayRotation rotation) override;
+
   // Brightness control (runtime mutable)
   void set_brightness(uint8_t brightness);
 
