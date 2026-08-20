@@ -490,7 +490,7 @@ APIError APINoiseFrameHelper::read_packet(ReadPacketBuffer *buffer) {
 }
 // Encrypt a single noise message in place and return the encrypted frame length.
 // Returns APIError::OK on success.
-APIError APINoiseFrameHelper::encrypt_noise_message_(uint8_t *buf_start, uint16_t payload_size, uint8_t message_type,
+APIError APINoiseFrameHelper::encrypt_noise_message_(uint8_t *buf_start, uint16_t payload_size, uint16_t message_type,
                                                      uint16_t &encrypted_len_out) {
   // Write noise header
   buf_start[0] = 0x01;  // indicator
@@ -523,7 +523,7 @@ APIError APINoiseFrameHelper::encrypt_noise_message_(uint8_t *buf_start, uint16_
   return APIError::OK;
 }
 
-APIError APINoiseFrameHelper::write_protobuf_packet(uint8_t type, ProtoWriteBuffer buffer) {
+APIError APINoiseFrameHelper::write_protobuf_packet(uint16_t type, ProtoWriteBuffer buffer) {
 #ifdef ESPHOME_DEBUG_API
   assert(this->state_ == State::DATA);
 #endif
