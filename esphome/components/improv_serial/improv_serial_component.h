@@ -2,13 +2,17 @@
 
 #include "esphome/components/improv_base/improv_base.h"
 #include "esphome/components/logger/logger.h"
-#include "esphome/components/wifi/wifi_component.h"
+#include "esphome/components/network/util.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
 #include "esphome/core/helpers.h"
-#ifdef USE_WIFI
+#ifdef USE_IMPROV_SERIAL
 #include <improv.h>
 #include <vector>
+
+#ifdef USE_WIFI
+#include "esphome/components/wifi/wifi_component.h"
+#endif
 
 #ifdef USE_ESP32
 #include <driver/uart.h>
@@ -45,6 +49,12 @@ enum ImprovSerialType : uint8_t {
 static const uint16_t IMPROV_SERIAL_TIMEOUT = 100;
 static const uint8_t IMPROV_SERIAL_VERSION = 1;
 
+// Wi-Fi connect failure timers: a fresh provision reports at 30 s (stock behavior), while
+// switching networks on an already-connected device (disconnect + reconnect) can legitimately
+// take longer; 90 s matches esp32_improv's default wifi_timeout.
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
+static const uint32_t WIFI_SWITCH_TIMEOUT_MS = 90000;
+
 class ImprovSerialComponent final : public Component, public improv_base::ImprovBase {
  public:
   void setup() override;
@@ -61,8 +71,11 @@ class ImprovSerialComponent final : public Component, public improv_base::Improv
   void send_current_state_(improv::State state);
   void set_error_(improv::Error error);
   void send_response_(std::vector<uint8_t> &response);
+#ifdef USE_WIFI
   void on_wifi_connect_timeout_();
+#endif
 
+  void collect_webserver_urls_(std::vector<std::string> &urls);
   std::vector<uint8_t> build_rpc_settings_response_(improv::Command command);
   std::vector<uint8_t> build_version_info_();
 
@@ -138,7 +151,14 @@ class ImprovSerialComponent final : public Component, public improv_base::Improv
 
   std::vector<uint8_t> rx_buffer_;
   uint32_t last_read_byte_{0};
+#ifdef USE_WIFI
   wifi::WiFiAP connecting_sta_;
+  // Gate for accepting a (re)connection as provisioning success: require the Wi-Fi component to
+  // have reported is_connected()==false at least once since WIFI_SETTINGS was received. Without
+  // this, changing networks on an already-connected device would immediately report the stale
+  // prior connection as "provisioned" before the new network is actually joined.
+  bool connect_saw_disconnect_{false};
+#endif
   improv::State state_{improv::STATE_AUTHORIZED};
 };
 
