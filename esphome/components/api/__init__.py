@@ -323,6 +323,7 @@ CONFIG_SCHEMA = cv.All(
                 host=4,  # Abundant resources
                 ln882x=4,  # Moderate RAM
                 nrf52=4,  # ~256KB RAM, BSD sockets
+                zephyr=4,  # Zephyr platform variants
             ): cv.int_range(min=1, max=10),
             cv.SplitDefault(
                 CONF_MAX_CONNECTIONS,
@@ -334,6 +335,22 @@ CONFIG_SCHEMA = cv.All(
                 host=8,  # Abundant resources
                 ln882x=5,  # Moderate RAM
                 nrf52=4,  # ~256KB RAM, BSD sockets, Thread (single HA controller)
+                zephyr_esp32=5,  # 520KB RAM available, same silicon as esp32
+                zephyr_esp32h2=4,  # ~320KB RAM, embedded target
+                zephyr_esp32c6=4,  # ~512KB RAM, embedded target
+                zephyr_esp32c5=4,  # 384KB RAM, embedded target
+                zephyr_esp32c3=4,  # ~400KB RAM, embedded target
+                zephyr_nativesim=8,  # Abundant resources
+                zephyr_nrf52=4,  # ~256KB RAM, BSD sockets, Thread (single HA controller)
+                zephyr_nrf54l15=4,  # ~256KB RAM, BSD sockets, Thread (single HA controller)
+                # 512KB RAM (double nrf54l15's), but kept at the same conservative
+                # value pending real-world profiling on this newer variant.
+                zephyr_nrf54lm20a=4,
+                zephyr_efr32mg24=4,  # ~256KB RAM, BSD sockets, Thread (single HA controller)
+                zephyr_rp2040=4,  # 264KB RAM, matches platform: rp2's own rp2=4 tier
+                zephyr_rp2350=4,  # 520KB RAM, kept at rp2040's conservative tier
+                zephyr_stm32l4=4,  # 128KB RAM (nucleo_l476rg), below every 8-tier board
+                zephyr_ra4m1=4,  # 32KB RAM -- smallest of any zephyr variant, kept at the floor
             ): cv.int_range(min=1, max=20),
             # Maximum queued send buffers per connection before dropping connection
             # Each buffer uses ~8-12 bytes overhead plus actual message size
@@ -349,6 +366,20 @@ CONFIG_SCHEMA = cv.All(
                 rtl87xx=8,  # Moderate RAM
                 host=16,  # Abundant resources
                 ln882x=8,  # Moderate RAM
+                zephyr_esp32=8,  # More RAM, can buffer more
+                zephyr_esp32h2=8,  # Moderate RAM
+                zephyr_esp32c6=8,  # Moderate RAM
+                zephyr_esp32c5=8,  # Moderate RAM
+                zephyr_esp32c3=8,  # Moderate RAM
+                zephyr_nativesim=16,  # Abundant resources
+                zephyr_nrf52=8,  # Moderate RAM
+                zephyr_nrf54l15=8,  # Moderate RAM
+                zephyr_nrf54lm20a=8,  # Moderate RAM, same reasoning as max_connections above
+                zephyr_efr32mg24=8,  # Moderate RAM
+                zephyr_rp2040=8,  # Moderate RAM, matches platform: rp2's own rp2=8 tier
+                zephyr_rp2350=8,  # Moderate RAM
+                zephyr_stm32l4=4,  # 128KB RAM, fail fast like esp8266 rather than buffer
+                zephyr_ra4m1=4,  # 32KB RAM -- fail fast, same tier as esp8266
             ): cv.int_range(min=1, max=64),
         }
     ).extend(cv.COMPONENT_SCHEMA),

@@ -351,6 +351,7 @@ def test_perform_ota_successful_md5_auth(
                 espota2.CLIENT_FEATURE_SUPPORTS_COMPRESSION
                 | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_AUTH
                 | espota2.CLIENT_FEATURE_SUPPORTS_EXTENDED_PROTOCOL
+                | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_CHECKSUM
             ]
         )
     )
@@ -1027,6 +1028,7 @@ def test_perform_ota_successful_sha256_auth(
                 espota2.CLIENT_FEATURE_SUPPORTS_COMPRESSION
                 | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_AUTH
                 | espota2.CLIENT_FEATURE_SUPPORTS_EXTENDED_PROTOCOL
+                | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_CHECKSUM
             ]
         )
     )
@@ -1083,6 +1085,7 @@ def test_perform_ota_sha256_fallback_to_md5(
                 espota2.CLIENT_FEATURE_SUPPORTS_COMPRESSION
                 | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_AUTH
                 | espota2.CLIENT_FEATURE_SUPPORTS_EXTENDED_PROTOCOL
+                | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_CHECKSUM
             ]
         )
     )
@@ -1192,6 +1195,7 @@ def test_perform_ota_extended_protocol_app(
                 espota2.CLIENT_FEATURE_SUPPORTS_COMPRESSION
                 | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_AUTH
                 | espota2.CLIENT_FEATURE_SUPPORTS_EXTENDED_PROTOCOL
+                | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_CHECKSUM
             ]
         )
     )
@@ -1252,6 +1256,7 @@ def test_perform_ota_successful_partition_table(
                 espota2.CLIENT_FEATURE_SUPPORTS_COMPRESSION
                 | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_AUTH
                 | espota2.CLIENT_FEATURE_SUPPORTS_EXTENDED_PROTOCOL
+                | espota2.CLIENT_FEATURE_SUPPORTS_SHA256_CHECKSUM
             ]
         )
     )
