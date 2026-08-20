@@ -16,6 +16,9 @@
 #ifdef USE_RUNTIME_IMAGE_PNG
 #include "png_decoder.h"
 #endif
+#ifdef USE_RUNTIME_IMAGE_QOI
+#include "qoi_decoder.h"
+#endif
 
 namespace esphome::runtime_image {
 
@@ -35,6 +38,24 @@ inline bool is_color_on(const Color &color) {
   // Approximation using fast integer computations; produces acceptable results
   // Equivalent to 0.25 * R + 0.5 * G + 0.25 * B
   return ((color.r >> 2) + (color.g >> 1) + (color.b >> 2)) & 0x80;
+}
+
+const char *get_mime_type_for_format(ImageFormat format) {
+  for (const auto &entry : MIME_LOOKUP_TABLE) {
+    if (entry.format == format) {
+      return entry.mime_type;
+    }
+  }
+  return "image/*";  // Default fallback
+}
+
+std::optional<ImageFormat> get_format_for_mime_type(const char *mime_type) {
+  for (const auto &entry : MIME_LOOKUP_TABLE) {
+    if (strcasestr(mime_type, entry.mime_type)) {
+      return entry.format;
+    }
+  }
+  return std::nullopt;
 }
 
 RuntimeImage::RuntimeImage(ImageFormat format, image::ImageType type, image::Transparency transparency,
@@ -171,15 +192,15 @@ void RuntimeImage::draw(int x, int y, display::Display *display, Color color_on,
   // If no image is loaded and no placeholder, nothing to draw
 }
 
-bool RuntimeImage::begin_decode(size_t expected_size) {
+bool RuntimeImage::begin_decode(size_t expected_size, ImageFormat format) {
   if (this->decoder_) {
     ESP_LOGW(TAG, "Decoding already in progress");
     return false;
   }
 
-  this->decoder_ = this->create_decoder_();
+  this->decoder_ = this->create_decoder_(format);
   if (!this->decoder_) {
-    ESP_LOGE(TAG, "Failed to create decoder for format %d", this->format_);
+    ESP_LOGE(TAG, "Failed to create decoder for format %d", format);
     return false;
   }
 
@@ -347,8 +368,14 @@ size_t RuntimeImage::get_buffer_size(int width, int height) const {
 
 int RuntimeImage::get_position_(int x, int y) const { return (x + y * this->buffer_width_) * this->get_bpp() / 8; }
 
-std::unique_ptr<ImageDecoder> RuntimeImage::create_decoder_() {
-  switch (this->format_) {
+std::unique_ptr<ImageDecoder> RuntimeImage::create_decoder_(ImageFormat format) {
+  // For backwards compatibility, if requested format is AUTO (=default), keep old behaviour
+  //   (use format supplied at construction)
+  if (format == AUTO) {
+    format = this->format_;
+  }
+
+  switch (format) {
 #ifdef USE_RUNTIME_IMAGE_BMP
     case BMP:
       return make_unique<BmpDecoder>(this);
@@ -361,8 +388,15 @@ std::unique_ptr<ImageDecoder> RuntimeImage::create_decoder_() {
     case PNG:
       return make_unique<PngDecoder>(this);
 #endif
+#ifdef USE_RUNTIME_IMAGE_QOI
+    case QOI:
+      return make_unique<QoiDecoder>(this);
+#endif
+    case AUTO:
+      ESP_LOGE(TAG, "Image format could not be determined; set `format:` explicitly in the configuration");
+      return nullptr;
     default:
-      ESP_LOGE(TAG, "Unsupported image format: %d", this->format_);
+      ESP_LOGE(TAG, "Unsupported image format: %d", format);
       return nullptr;
   }
 }

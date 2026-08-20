@@ -2,8 +2,10 @@
 #include "esphome/components/runtime_image/image_decoder.h"
 #include "esphome/core/log.h"
 #include <algorithm>
+#include <cstring>
 
 static const char *const TAG = "online_image";
+static const char *const CONTENT_TYPE_HEADER_NAME = "content-type";
 static const char *const ETAG_HEADER_NAME = "etag";
 static const char *const IF_NONE_MATCH_HEADER_NAME = "if-none-match";
 static const char *const LAST_MODIFIED_HEADER_NAME = "last-modified";
@@ -60,28 +62,11 @@ void OnlineImage::update() {
     headers.push_back({IF_MODIFIED_SINCE_HEADER_NAME, this->last_modified_});
   }
 
+  runtime_image::ImageFormat format = this->get_format();
   // Add Accept header based on image format
-  const char *accept_mime_type;
-  switch (this->get_format()) {
-#ifdef USE_RUNTIME_IMAGE_BMP
-    case runtime_image::BMP:
-      accept_mime_type = "image/bmp,*/*;q=0.8";
-      break;
-#endif
-#ifdef USE_RUNTIME_IMAGE_JPEG
-    case runtime_image::JPEG:
-      accept_mime_type = "image/jpeg,*/*;q=0.8";
-      break;
-#endif
-#ifdef USE_RUNTIME_IMAGE_PNG
-    case runtime_image::PNG:
-      accept_mime_type = "image/png,*/*;q=0.8";
-      break;
-#endif
-    default:
-      accept_mime_type = "image/*,*/*;q=0.8";
-      break;
-  }
+  char accept_mime_type[esphome::runtime_image::MAX_MIME_TYPE_LENGTH + 11];
+  snprintf(accept_mime_type, sizeof(accept_mime_type), "%s,*/*;q=0.8",
+           esphome::runtime_image::get_mime_type_for_format(format));
   headers.push_back({"Accept", accept_mime_type});
 
   // User headers last so they can override any of the above
@@ -89,8 +74,8 @@ void OnlineImage::update() {
     headers.push_back(http_request::Header{header.first, header.second.value()});
   }
 
-  this->downloader_ = this->parent_->get(this->url_, headers, {ETAG_HEADER_NAME, LAST_MODIFIED_HEADER_NAME});
-
+  this->downloader_ =
+      this->parent_->get(this->url_, headers, {ETAG_HEADER_NAME, LAST_MODIFIED_HEADER_NAME, CONTENT_TYPE_HEADER_NAME});
   if (this->downloader_ == nullptr) {
     ESP_LOGE(TAG, "Download failed.");
     this->end_connection_();
@@ -115,17 +100,34 @@ void OnlineImage::update() {
 
   ESP_LOGD(TAG, "Starting download");
   size_t total_size = this->downloader_->content_length;
+  ESP_LOGV(TAG, "Content-Length: %zu", total_size);
+
+  if (format == runtime_image::AUTO) {
+    // Try to auto-detect format from Content-Type header
+    auto content_type = this->downloader_->get_response_header(CONTENT_TYPE_HEADER_NAME);
+    ESP_LOGV(TAG, "Content-Type: %s", content_type.c_str());
+    auto mime_format = esphome::runtime_image::get_format_for_mime_type(content_type.c_str());
+    if (mime_format.has_value()) {
+      format = *mime_format;
+    } else {
+      ESP_LOGE(TAG, "Image format '%s' not supported", content_type.c_str());
+      this->end_connection_();
+      this->download_error_callback_.call();
+      return;
+    }
+  }
+  ESP_LOGD(TAG, "Using image format: %d", format);
 
   // Initialize decoder with the known format
-  if (!this->begin_decode(total_size)) {
-    ESP_LOGE(TAG, "Failed to initialize decoder for format %d", this->get_format());
+  if (!this->begin_decode(total_size, format)) {
+    ESP_LOGE(TAG, "Failed to initialize decoder for format %d", format);
     this->end_connection_();
     this->download_error_callback_.call();
     return;
   }
 
   // JPEG requires the complete image in the download buffer before decoding
-  if (this->get_format() == runtime_image::JPEG && total_size > this->download_buffer_.size()) {
+  if (format == runtime_image::JPEG && total_size > this->download_buffer_.size()) {
     this->download_buffer_.resize(total_size);
   }
 

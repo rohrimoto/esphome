@@ -27,6 +27,7 @@ ImageDecoder = runtime_image_ns.class_("ImageDecoder")
 BmpDecoder = runtime_image_ns.class_("BmpDecoder", ImageDecoder)
 JpegDecoder = runtime_image_ns.class_("JpegDecoder", ImageDecoder)
 PngDecoder = runtime_image_ns.class_("PngDecoder", ImageDecoder)
+QoiDecoder = runtime_image_ns.class_("QoiDecoder", ImageDecoder)
 
 # Runtime image class
 RuntimeImage = runtime_image_ns.class_(
@@ -36,9 +37,10 @@ RuntimeImage = runtime_image_ns.class_(
 # Image format enum
 ImageFormat = runtime_image_ns.enum("ImageFormat")
 IMAGE_FORMAT_AUTO = ImageFormat.AUTO
+IMAGE_FORMAT_BMP = ImageFormat.BMP
 IMAGE_FORMAT_JPEG = ImageFormat.JPEG
 IMAGE_FORMAT_PNG = ImageFormat.PNG
-IMAGE_FORMAT_BMP = ImageFormat.BMP
+IMAGE_FORMAT_QOI = ImageFormat.QOI
 
 # Export enum for decode errors
 DecodeError = runtime_image_ns.enum("DecodeError")
@@ -56,6 +58,19 @@ class Format:
 
     def actions(self) -> None:
         """Add defines and libraries needed for this format."""
+
+
+class AUTOFormat(Format):
+    """AUTO format - detect form Mime Type."""
+
+    def __init__(self):
+        super().__init__("AUTO", None)
+
+    def actions(self) -> None:
+        BMPFormat().actions()
+        JPEGFormat().actions()
+        PNGFormat().actions()
+        QOIFormat().actions()
 
 
 class BMPFormat(Format):
@@ -97,12 +112,24 @@ class PNGFormat(Format):
         cg.add_library("pngle", "1.1.0")
 
 
+class QOIFormat(Format):
+    """QOI format decoder configuration."""
+
+    def __init__(self):
+        super().__init__("QOI", BmpDecoder)
+
+    def actions(self) -> None:
+        cg.add_define("USE_RUNTIME_IMAGE_QOI")
+
+
 # Registry of available formats
 IMAGE_FORMATS = {
+    "AUTO": AUTOFormat(),
     "BMP": BMPFormat(),
     "JPEG": JPEGFormat(),
-    "PNG": PNGFormat(),
     "JPG": JPEGFormat(),  # Alias for JPEG
+    "PNG": PNGFormat(),
+    "QOI": QOIFormat(),
 }
 
 
