@@ -19,6 +19,8 @@ namespace esphome::openthread {
 
 class InstanceLock;
 
+enum class TeardownStage : uint8_t { NOT_STARTED = 0, STOP_IN_PROCESS, COMPLETED };
+
 template<typename... Ts> class OpenThreadComponentPollPeriodAction;
 
 class OpenThreadComponent final : public Component {
@@ -71,8 +73,7 @@ class OpenThreadComponent final : public Component {
 #endif
   std::optional<int8_t> output_power_{};
   std::atomic<bool> lock_initialized_{false};
-  bool teardown_started_{false};
-  bool teardown_complete_{false};
+  std::atomic<TeardownStage> teardown_stage_{TeardownStage::NOT_STARTED};
   bool connected_{false};
 
  private:
