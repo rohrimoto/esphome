@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "esphome/components/climate_ir/climate_ir.h"
 
 namespace esphome::gree {
@@ -68,16 +70,59 @@ static constexpr uint8_t GREE_HDIR_MIDDLE = 0x04;
 static constexpr uint8_t GREE_HDIR_MRIGHT = 0x05;
 static constexpr uint8_t GREE_HDIR_RIGHT = 0x06;
 
-// Only available on YX1FF
-// Turbo (high) fan mode + sleep preset mode
-static constexpr uint8_t GREE_FAN_TURBO = 0x80;
+// Byte 2 feature bits
 static constexpr uint8_t GREE_FAN_TURBO_BIT = 0x10;
+static constexpr uint8_t GREE_LIGHT_BIT = 0x20;
+static constexpr uint8_t GREE_MODEL_A_BIT = 0x40;
+static constexpr uint8_t GREE_XFAN_BIT = 0x80;
+
+// Only available on YX1FF
+// Sleep preset mode
 static constexpr uint8_t GREE_PRESET_NONE = 0x00;
 static constexpr uint8_t GREE_PRESET_SLEEP = 0x01;
 static constexpr uint8_t GREE_PRESET_SLEEP_BIT = 0x80;
 
 // Model codes
 enum Model { GREE_GENERIC, GREE_YAN, GREE_YAA, GREE_YAC, GREE_YAC1FB9, GREE_YX1FF, GREE_YAG };
+
+using GreeState = std::array<uint8_t, GREE_STATE_FRAME_SIZE>;
+
+struct GreeClimateData {
+  climate::ClimateMode mode;
+  uint8_t target_temperature;
+  climate::ClimateFanMode fan_mode;
+  climate::ClimateSwingMode swing_mode;
+  climate::ClimatePreset preset;
+};
+
+class GreeProtocol {
+ public:
+  explicit GreeProtocol(Model model) : model_(model) {}
+
+  void encode(remote_base::RemoteTransmitData *data, const GreeState &state) const;
+  optional<GreeState> decode(remote_base::RemoteReceiveData data) const;
+
+  static uint8_t calculate_checksum(const GreeState &state);
+  static bool valid_checksum(const GreeState &state);
+
+ protected:
+  bool decode_bytes_(remote_base::RemoteReceiveData *data, GreeState *state, uint8_t offset) const;
+
+  Model model_;
+};
+
+class GreeClimateCodec {
+ public:
+  static GreeState encode(Model model, const GreeClimateData &data, uint8_t mode_bits = 0);
+  static optional<GreeClimateData> decode(Model model, const GreeState &state);
+
+ protected:
+  static uint8_t encode_operation_mode(climate::ClimateMode mode);
+  static uint8_t encode_fan_mode(Model model, climate::ClimateFanMode fan_mode);
+  static uint8_t encode_horizontal_swing(climate::ClimateSwingMode swing_mode);
+  static uint8_t encode_vertical_swing(climate::ClimateSwingMode swing_mode);
+  static optional<GreeClimateData> decode_yx1ff(const GreeState &state);
+};
 
 class GreeClimate final : public climate_ir::ClimateIR {
  public:
@@ -94,14 +139,8 @@ class GreeClimate final : public climate_ir::ClimateIR {
  protected:
   // Transmit via IR the state of this climate controller.
   void transmit_state() override;
+  bool on_receive(remote_base::RemoteReceiveData data) override;
   climate::ClimateTraits traits() override;
-
-  uint8_t operation_mode_();
-  uint8_t fan_speed_();
-  uint8_t horizontal_swing_();
-  uint8_t vertical_swing_();
-  uint8_t temperature_();
-  uint8_t preset_();
 
   Model model_{};
   uint8_t mode_bits_{0};  // Combined mode bits for remote_state[2]
