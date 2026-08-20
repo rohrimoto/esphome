@@ -27,7 +27,7 @@ TIDY_PROJECT_NAME = "esphome_tidy"
 
 # Analyzed against the native toolchain's default SDK version
 # (RECOMMENDED_SDK_NRF_VERSION), which also keys the CI install cache.
-_TIDY_BOARD = "adafruit_itsybitsy_nrf52840"
+_TIDY_BOARD = "adafruit_itsybitsy/nrf52840"
 
 # Never compiled (the build is configure-only): the file exists only so the
 # app target emits a C++ compile command to harvest flags/includes from.
@@ -62,7 +62,7 @@ CONFIG_MCUMGR_GRP_IMG_UPLOAD_CHECK_HOOK=y
 CONFIG_MCUMGR_TRANSPORT_UART=y
 #mcumgr end
 #zigbee begin
-CONFIG_ZIGBEE=y
+CONFIG_ZIGBEE_ADD_ON=y
 CONFIG_CRYPTO=y
 CONFIG_NVS=y
 CONFIG_SETTINGS=y
@@ -197,7 +197,9 @@ def generate_compile_commands(work_dir: Path, platformio_ini: Path) -> Path:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     _setup_core(work_dir)
-    check_and_install()
+    # The tidy project's prj.conf always requests zigbee Kconfig coverage (see
+    # _TIDY_PRJ_CONF's #zigbee block), so it always needs the ncs-zigbee module.
+    check_and_install(zigbee=True)
 
     library_include_dirs = "\n".join(
         f'  "{d}"' for d in _library_include_dirs(platformio_ini)
@@ -216,12 +218,22 @@ def generate_compile_commands(work_dir: Path, platformio_ini: Path) -> Path:
     if build_dir.is_dir():
         rmtree(build_dir)
 
-    paths = get_build_paths()
+    paths = get_build_paths(zigbee=True)
     # Build only the generated-headers target (syscall_list.h, offsets.h, ...)
     # on top of the configure: clang-tidy needs those headers to exist, but a
     # full firmware build would be wasted work. --no-sysbuild keeps sdk-nrf
     # 2.9+ from wrapping the build in a multi-image sysbuild project, which
     # would nest the compile commands and hide the headers target.
+    #
+    # Zephyr's own "zephyr_generated_headers" is an INTERFACE library with no
+    # sources of its own (just add_dependencies() on the real generators) --
+    # NCS 3.4.0's bundled CMake (4.x) no longer emits a Ninja alias for a
+    # sourceless INTERFACE library, so `-t zephyr_generated_headers` fails with
+    # "unknown target". `cmake_object_order_depends_target_app` is CMake's own
+    # generated alias for the app object files' order-only dependencies -- it
+    # resolves to exactly the same generated-header set (confirmed by
+    # inspecting build.ninja) without compiling main.cpp, and it's an actual
+    # Ninja target regardless of INTERFACE-library alias behavior.
     west_cmd = [
         str(paths["python_executable"]),
         "-m",
@@ -234,13 +246,13 @@ def generate_compile_commands(work_dir: Path, platformio_ini: Path) -> Path:
         str(build_dir),
         str(source_dir),
         "-t",
-        "zephyr_generated_headers",
+        "cmake_object_order_depends_target_app",
         "--",
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     ]
     if not run_command_ok(
         west_cmd,
-        env=get_build_env(),
+        env=get_build_env(zigbee=True),
         stream_output=True,
         cwd=str(paths["framework_path"]),
     ):
