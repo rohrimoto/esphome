@@ -2,6 +2,7 @@
 #ifdef USE_OPENTHREAD
 #include "openthread.h"
 
+#include <openthread/child_supervision.h>
 #include <openthread/cli.h>
 #include <openthread/instance.h>
 #include <openthread/logging.h>
@@ -52,6 +53,7 @@ void OpenThreadComponent::on_state_changed(otChangedFlags flags, void *context) 
     otInstance *instance = self->get_openthread_instance_();
     otDeviceRole role = otThreadGetDeviceRole(instance);
     self->connected_ = role >= OT_DEVICE_ROLE_CHILD;
+    self->publish_state(role);
   }
 }
 
@@ -229,26 +231,51 @@ void *OpenThreadSrpComponent::pool_alloc_(size_t size) {
 void OpenThreadSrpComponent::set_mdns(esphome::mdns::MDNSComponent *mdns) { this->mdns_ = mdns; }
 
 bool OpenThreadComponent::teardown() {
-  if (!this->teardown_started_) {
-    this->teardown_started_ = true;
-    ESP_LOGD(TAG, "Clear Srp");
-    auto lock = InstanceLock::try_acquire(100);
-    if (!lock) {
-      ESP_LOGW(TAG, "Failed to acquire OpenThread lock during teardown, leaking memory");
+  switch (this->teardown_stage_) {
+    case TeardownStage::NOT_STARTED: {
+      // start tearing down
+      this->teardown_stage_ = TeardownStage::STOP_IN_PROCESS;
+      ESP_LOGV(TAG, "Clear Srp");
+      // If the lock can't be acquired here, the OT task is likely wedged, so give up on
+      // teardown entirely rather than forcing the stop stage without the lock -- we're
+      // already shutting down, so this is an accepted low-risk failure mode.
+      {
+        auto lock = InstanceLock::try_acquire(100);
+        if (!lock) {
+          ESP_LOGW(TAG, "Failed to acquire OpenThread lock during teardown, leaking memory");
+          this->teardown_stage_ = TeardownStage::COMPLETED;
+          return true;
+        }
+        otInstance *instance = lock.get_instance();
+        otSrpClientClearHostAndServices(instance);
+        otSrpClientBuffersFreeAllServices(instance);
+        if (otThreadSetEnabled(instance, false) != OT_ERROR_NONE) {
+          ESP_LOGW(TAG, "Failed to disable Thread during teardown");
+        }
+        if (otIp6SetEnabled(instance, false) != OT_ERROR_NONE) {
+          ESP_LOGW(TAG, "Failed to disable IPv6 during teardown");
+        }
+        // Release the lock before stopping -- openthread_stop_() (esp_openthread_stop() on
+        // ESP32) acquires it internally, and the lock is not recursive.
+      }
+      // stop openthread
+      global_openthread_component = nullptr;
+      ESP_LOGV(TAG, "Stop Openthread");
+      int error = this->openthread_stop_();
+      if (error != 0) {
+        ESP_LOGW(TAG, "Failed attempt to stop openthread %d", error);
+        this->teardown_stage_ = TeardownStage::COMPLETED;
+        return true;
+      }
+    } break;
+    case TeardownStage::STOP_IN_PROCESS:
+      // waiting on openthread stop
+      break;
+    case TeardownStage::COMPLETED:
+      ESP_LOGV(TAG, "OpenthreadComponent Teardown Complete");
       return true;
-    }
-    otInstance *instance = lock.get_instance();
-    otSrpClientClearHostAndServices(instance);
-    otSrpClientBuffersFreeAllServices(instance);
-    global_openthread_component = nullptr;
-    ESP_LOGD(TAG, "Exit main loop ");
-    int error = this->openthread_stop_();
-    if (error != 0) {
-      ESP_LOGW(TAG, "Failed attempt to stop main loop %d", error);
-      this->teardown_complete_ = true;
-    }
   }
-  return this->teardown_complete_;
+  return this->teardown_stage_ == TeardownStage::COMPLETED;
 }
 
 void OpenThreadComponent::on_factory_reset(std::function<void()> callback) {
@@ -279,6 +306,20 @@ void OpenThreadComponent::apply_linkmode_(otInstance *instance) {
     }
     ESP_LOGD(TAG, "Link Polling Period: %" PRIu32, otLinkGetPollPeriod(instance));
   }
+
+  uint16_t poll_period_sec = (this->poll_period_ + 500) / 1000;
+  // Minimums match OpenThread defaults: src/core/config/mle.h OPENTHREAD_CONFIG_MLE_CHILD_TIMEOUT_DEFAULT
+  otThreadSetChildTimeout(instance, std::max(poll_period_sec * 4, 240));
+  // Minimums match OpenThread defaults: src/core/config/child_supervision.h
+  // OPENTHREAD_CONFIG_CHILD_SUPERVISION_CHECK_TIMEOUT
+  otChildSupervisionSetCheckTimeout(instance, std::max(poll_period_sec * 2, 190));
+  // Minimums match OpenThread defaults: src/core/config/child_supervision.h
+  // OPENTHREAD_CONFIG_CHILD_SUPERVISION_INTERVAL
+  otChildSupervisionSetInterval(instance, std::max((uint16_t) (poll_period_sec * 3 / 2), (uint16_t) 129));
+  ESP_LOGD(TAG, "Child Timeout: %d sec, Child Supervision Check Timeout: %d sec, Child Supervision Interval: %d sec",
+           otThreadGetChildTimeout(instance), otChildSupervisionGetCheckTimeout(instance),
+           otChildSupervisionGetInterval(instance));
+
   link_mode_config.mRxOnWhenIdle = this->poll_period_ == 0;
   link_mode_config.mDeviceType = false;
   link_mode_config.mNetworkData = false;
@@ -293,6 +334,13 @@ void OpenThreadComponent::apply_linkmode_(otInstance *instance) {
            TRUEFALSE(link_mode_config.mDeviceType), TRUEFALSE(link_mode_config.mNetworkData),
            TRUEFALSE(link_mode_config.mRxOnWhenIdle));
 #endif
+}
+
+void OpenThreadComponent::publish_state(otDeviceRole role) {
+  ESP_LOGD(TAG, "Publish State: %d", role);
+  this->state_callbacks_.call(role);
+  this->full_state_callbacks_.call(this->active_role_, role);
+  this->active_role_ = role;
 }
 
 }  // namespace esphome::openthread

@@ -19,6 +19,8 @@ namespace esphome::openthread {
 
 class InstanceLock;
 
+enum class TeardownStage : uint8_t { NOT_STARTED = 0, STOP_IN_PROCESS, COMPLETED };
+
 template<typename... Ts> class OpenThreadComponentPollPeriodAction;
 
 class OpenThreadComponent final : public Component {
@@ -35,7 +37,6 @@ class OpenThreadComponent final : public Component {
   bool is_lock_initialized() const { return this->lock_initialized_; }
   network::IPAddresses get_ip_addresses();
   std::optional<otIp6Address> get_omr_address();
-  void ot_main();
   void on_factory_reset(std::function<void()> callback);
   void defer_factory_reset_external_callback();
 
@@ -51,6 +52,14 @@ class OpenThreadComponent final : public Component {
   void set_connected(bool connected) { this->connected_ = connected; }
   static void on_state_changed(otChangedFlags flags, void *context);
 
+  void publish_state(otDeviceRole role);
+  template<typename F> void add_on_state_callback(F &&callback) {
+    this->state_callbacks_.add(std::forward<F>(callback));
+  }
+  template<typename F> void add_full_state_callback(F &&callback) {
+    this->full_state_callbacks_.add(std::forward<F>(callback));
+  }
+
  protected:
   // Actions re-apply link mode under the OT lock; allow them to call apply_linkmode_()
   // without exposing this lock-sensitive, raw-instance method on the public API.
@@ -58,7 +67,6 @@ class OpenThreadComponent final : public Component {
 
   /** Apply Link Mode settings (incl poll period).
    * Callers running outside the OpenThread task must hold InstanceLock.
-   * ot_main() runs on the OpenThread task itself and must not acquire the lock.
    */
   void apply_linkmode_(otInstance *instance);
 
@@ -71,9 +79,13 @@ class OpenThreadComponent final : public Component {
 #endif
   std::optional<int8_t> output_power_{};
   std::atomic<bool> lock_initialized_{false};
-  bool teardown_started_{false};
-  bool teardown_complete_{false};
+  std::atomic<TeardownStage> teardown_stage_{TeardownStage::NOT_STARTED};
   bool connected_{false};
+
+  otDeviceRole active_role_{OT_DEVICE_ROLE_DISABLED};
+
+  LazyCallbackManager<void(otDeviceRole)> state_callbacks_{};
+  LazyCallbackManager<void(otDeviceRole previous, otDeviceRole current)> full_state_callbacks_;
 
  private:
   // Stores a pointer to a string literal (static storage duration).
