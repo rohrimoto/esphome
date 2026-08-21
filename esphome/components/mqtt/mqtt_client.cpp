@@ -42,6 +42,7 @@ MQTTClientComponent::MQTTClientComponent() {
   char mac_addr[MAC_ADDRESS_BUFFER_SIZE];
   get_mac_address_into_buffer(mac_addr);
   this->credentials_.client_id = make_name_with_suffix(App.get_name(), '-', mac_addr, MAC_ADDRESS_BUFFER_SIZE - 1);
+  this->topic_prefix_ = App.get_name();
 }
 
 // Connection
@@ -211,8 +212,12 @@ void MQTTClientComponent::dump_config() {
   if (!this->log_message_.topic.empty()) {
     ESP_LOGCONFIG(TAG, "  Log Topic: '%s'", this->log_message_.topic.c_str());
   }
-  if (!this->availability_.topic.empty()) {
-    ESP_LOGCONFIG(TAG, "  Availability: '%s'", this->availability_.topic.c_str());
+  ESP_LOGCONFIG(TAG, "  Status Topic: '%s'", this->get_status_topic().c_str());
+  if (this->birth_death_enabled_) {
+    ESP_LOGCONFIG(TAG, "  Birth and death messages enabled");
+  }
+  if (this->status_.lwt.enabled) {
+    ESP_LOGCONFIG(TAG, "  Last will and testament enabled");
   }
 }
 bool MQTTClientComponent::can_proceed() {
@@ -320,9 +325,10 @@ void MQTTClientComponent::start_connect_() {
   this->mqtt_backend_.set_credentials(username, password);
 
   this->mqtt_backend_.set_server(this->credentials_.address.c_str(), this->credentials_.port);
-  if (!this->last_will_.topic.empty()) {
-    this->mqtt_backend_.set_will(this->last_will_.topic.c_str(), this->last_will_.qos, this->last_will_.retain,
-                                 this->last_will_.payload.c_str());
+
+  if (this->status_.lwt.enabled) {
+    this->mqtt_backend_.set_will(this->get_status_topic().c_str(), this->status_.lwt.qos, this->status_.lwt.retain,
+                                 this->status_.payload_not_available.c_str());
   }
 
   this->mqtt_backend_.connect();
@@ -343,7 +349,7 @@ void MQTTClientComponent::check_connected() {
   }
 
   this->state_ = MQTT_CLIENT_CONNECTED;
-  this->sent_birth_message_ = false;
+  this->birth_message_sent_ = false;
   this->status_clear_warning();
   ESP_LOGI(TAG, "Connected");
   // MQTT Client needs some time to be fully set up.
@@ -392,8 +398,9 @@ void MQTTClientComponent::loop() {
         ESP_LOGW(TAG, "Lost client connection");
         this->start_dnslookup_();
       } else {
-        if (!this->birth_message_.topic.empty() && !this->sent_birth_message_) {
-          this->sent_birth_message_ = this->publish(this->birth_message_);
+        if (this->birth_death_enabled_ && !this->birth_message_sent_) {
+          this->birth_message_sent_ = this->publish(get_status_topic(), this->status_.payload_available,
+                                                    this->status_.birth.qos, this->status_.birth.retain);
         }
 
         this->last_connected_ = now;
@@ -674,51 +681,35 @@ void MQTTClientComponent::set_log_level(int level) { this->log_level_ = level; }
 void MQTTClientComponent::set_keep_alive(uint16_t keep_alive_s) { this->mqtt_backend_.set_keep_alive(keep_alive_s); }
 void MQTTClientComponent::set_log_message_template(MQTTMessage &&message) { this->log_message_ = std::move(message); }
 const MQTTDiscoveryInfo &MQTTClientComponent::get_discovery_info() const { return this->discovery_info_; }
-void MQTTClientComponent::set_topic_prefix(const std::string &topic_prefix, const std::string &check_topic_prefix) {
-  if (App.is_name_add_mac_suffix_enabled() && (topic_prefix == check_topic_prefix)) {
-    char buf[ESPHOME_DEVICE_NAME_MAX_LEN + 1];
-    this->topic_prefix_ = str_sanitize_to(buf, App.get_name().c_str());
-  } else {
-    this->topic_prefix_ = topic_prefix;
-  }
-}
+void MQTTClientComponent::set_topic_prefix(const std::string &topic_prefix) { this->topic_prefix_ = topic_prefix; }
 const std::string &MQTTClientComponent::get_topic_prefix() const { return this->topic_prefix_; }
+void MQTTClientComponent::set_status_topic(const std::string &topic) { this->status_.topic = topic; };
+const std::string MQTTClientComponent::get_status_topic() {
+  if (this->status_.topic.has_value()) {
+    return this->status_.topic.value();
+  }
+
+  return this->get_topic_prefix() + "/status";
+}
+void MQTTClientComponent::set_lwt_enabled(bool enabled) { this->status_.lwt.enabled = enabled; }
+void MQTTClientComponent::set_birth_enabled(bool enabled) { this->status_.birth.enabled = enabled; }
+void MQTTClientComponent::set_death_enabled(bool enabled) { this->status_.death.enabled = enabled; }
+void MQTTClientComponent::set_lwt_params(const MQTTClientStatusMessageConfig &conf) { this->status_.lwt = conf; }
+void MQTTClientComponent::set_birth_params(const MQTTClientStatusMessageConfig &conf) { this->status_.birth = conf; }
+void MQTTClientComponent::set_death_params(const MQTTClientStatusMessageConfig &conf) { this->status_.death = conf; }
+const Availability MQTTClientComponent::get_availability() {
+  return Availability{
+      .topic = get_status_topic(),
+      .payload_available = this->status_.payload_available,
+      .payload_not_available = this->status_.payload_not_available,
+  };
+}
 void MQTTClientComponent::set_publish_nan_as_none(bool publish_nan_as_none) {
   this->publish_nan_as_none_ = publish_nan_as_none;
 }
 bool MQTTClientComponent::is_publish_nan_as_none() const { return this->publish_nan_as_none_; }
-void MQTTClientComponent::disable_birth_message() {
-  this->birth_message_.topic = "";
-  this->recalculate_availability_();
-}
-void MQTTClientComponent::disable_shutdown_message() {
-  this->shutdown_message_.topic = "";
-  this->recalculate_availability_();
-}
 bool MQTTClientComponent::is_discovery_enabled() const { return !this->discovery_info_.prefix.empty(); }
 bool MQTTClientComponent::is_discovery_ip_enabled() const { return this->discovery_info_.discover_ip; }
-const Availability &MQTTClientComponent::get_availability() { return this->availability_; }
-void MQTTClientComponent::recalculate_availability_() {
-  if (this->birth_message_.topic.empty() || this->birth_message_.topic != this->last_will_.topic) {
-    this->availability_.topic = "";
-    return;
-  }
-  this->availability_.topic = this->birth_message_.topic;
-  this->availability_.payload_available = this->birth_message_.payload;
-  this->availability_.payload_not_available = this->last_will_.payload;
-}
-
-void MQTTClientComponent::set_last_will(MQTTMessage &&message) {
-  this->last_will_ = std::move(message);
-  this->recalculate_availability_();
-}
-
-void MQTTClientComponent::set_birth_message(MQTTMessage &&message) {
-  this->birth_message_ = std::move(message);
-  this->recalculate_availability_();
-}
-
-void MQTTClientComponent::set_shutdown_message(MQTTMessage &&message) { this->shutdown_message_ = std::move(message); }
 
 void MQTTClientComponent::set_discovery_info(std::string &&prefix, MQTTDiscoveryUniqueIdGenerator unique_id_generator,
                                              MQTTDiscoveryObjectIdGenerator object_id_generator, bool retain,
@@ -731,8 +722,6 @@ void MQTTClientComponent::set_discovery_info(std::string &&prefix, MQTTDiscovery
   this->discovery_info_.clean = clean;
 }
 
-void MQTTClientComponent::disable_last_will() { this->last_will_.topic = ""; }
-
 void MQTTClientComponent::disable_discovery() {
   this->discovery_info_ = MQTTDiscoveryInfo{
       .prefix = "",
@@ -744,11 +733,11 @@ void MQTTClientComponent::disable_discovery() {
   };
 }
 void MQTTClientComponent::on_shutdown() {
-  if (!this->shutdown_message_.topic.empty()) {
-    yield();
-    this->publish(this->shutdown_message_);
-    yield();
+  if (this->birth_death_enabled_) {
+    this->publish(this->get_status_topic(), this->status_.payload_not_available, this->status_.death.qos,
+                  this->status_.death.retain);
   }
+
   this->mqtt_backend_.disconnect();
 }
 
