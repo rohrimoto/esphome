@@ -8,6 +8,11 @@
 
 namespace esphome::runtime_image {
 
+/// Canonical MIME type for a format; "image/*" for AUTO/unknown
+const char *get_mime_type_for_format(ImageFormat format);
+/// Case-insensitive substring match of known media types; nullopt if none found
+std::optional<ImageFormat> get_format_for_mime_type(const char *mime_type);
+
 /**
  * @brief A dynamic image that can be loaded and decoded at runtime.
  *
@@ -62,9 +67,10 @@ class RuntimeImage : public image::Image {
    * @brief Begin decoding an image.
    *
    * @param expected_size Optional hint about the expected data size.
+   * @param format The image format to decode (defaults to AUTO, which uses the value set at construction).
    * @return true if decoder was successfully initialized.
    */
-  bool begin_decode(size_t expected_size = 0);
+  bool begin_decode(size_t expected_size = 0, ImageFormat format = AUTO);
 
   /**
    * @brief Feed data to the decoder.
@@ -103,6 +109,7 @@ class RuntimeImage : public image::Image {
   /**
    * @brief Get the image format.
    */
+  /// Configured format; a format resolved per decode lives on the active decoder
   ImageFormat get_format() const { return this->format_; }
 
   /**

@@ -37,6 +37,43 @@ inline bool is_color_on(const Color &color) {
   return ((color.r >> 2) + (color.g >> 1) + (color.b >> 2)) & 0x80;
 }
 
+struct MimeLookup {
+  const char *mime_type;
+  ImageFormat format;
+};
+
+// The first entry per format is its canonical MIME type; the rest are aliases
+// seen from real servers (older IIS, CDNs, S3)
+static constexpr MimeLookup MIME_LOOKUP_TABLE[] = {
+#ifdef USE_RUNTIME_IMAGE_BMP
+    {"image/bmp", ImageFormat::BMP},   {"image/x-ms-bmp", ImageFormat::BMP}, {"image/x-bmp", ImageFormat::BMP},
+#endif
+#ifdef USE_RUNTIME_IMAGE_JPEG
+    {"image/jpeg", ImageFormat::JPEG}, {"image/jpg", ImageFormat::JPEG},
+#endif
+#ifdef USE_RUNTIME_IMAGE_PNG
+    {"image/png", ImageFormat::PNG},   {"image/x-png", ImageFormat::PNG},
+#endif
+};
+
+const char *get_mime_type_for_format(ImageFormat format) {
+  for (const auto &entry : MIME_LOOKUP_TABLE) {
+    if (entry.format == format) {
+      return entry.mime_type;
+    }
+  }
+  return "image/*";  // AUTO or compiled-out format
+}
+
+std::optional<ImageFormat> get_format_for_mime_type(const char *mime_type) {
+  for (const auto &entry : MIME_LOOKUP_TABLE) {
+    if (str_contains_ignore_case(mime_type, entry.mime_type)) {
+      return entry.format;
+    }
+  }
+  return std::nullopt;
+}
+
 RuntimeImage::RuntimeImage(ImageFormat format, image::ImageType type, image::Transparency transparency,
                            image::Image *placeholder, bool is_big_endian, int fixed_width, int fixed_height)
     : Image(nullptr, 0, 0, type, transparency),
@@ -171,22 +208,27 @@ void RuntimeImage::draw(int x, int y, display::Display *display, Color color_on,
   // If no image is loaded and no placeholder, nothing to draw
 }
 
-bool RuntimeImage::begin_decode(size_t expected_size) {
+bool RuntimeImage::begin_decode(size_t expected_size, ImageFormat format) {
   if (this->is_decoding()) {
     ESP_LOGW(TAG, "Decoding already in progress");
     return false;
   }
 
+  if (format == AUTO && this->format_ != AUTO) {
+    // Fall back to the configured format before the reuse check below
+    format = this->format_;
+  }
+
   // An idle decoder for a different format cannot be reused
-  if (this->decoder_ != nullptr && this->decoder_->get_format() != this->format_) {
-    ESP_LOGD(TAG, "Decoder format mismatch: current: %d, new: %d", this->decoder_->get_format(), this->format_);
+  if (this->decoder_ != nullptr && this->decoder_->get_format() != format) {
+    ESP_LOGD(TAG, "Decoder format mismatch: current: %d, new: %d", this->decoder_->get_format(), format);
     this->decoder_ = nullptr;
   }
 
   if (!this->decoder_) {
-    this->decoder_ = this->create_decoder_(this->format_);
+    this->decoder_ = this->create_decoder_(format);
     if (!this->decoder_) {
-      ESP_LOGE(TAG, "Failed to create decoder for format %d", this->format_);
+      ESP_LOGE(TAG, "Failed to create decoder for format %d", format);
       return false;
     }
   }
@@ -364,6 +406,9 @@ std::unique_ptr<ImageDecoder> RuntimeImage::create_decoder_(ImageFormat format) 
     case PNG:
       return make_unique<PngDecoder>(this);
 #endif
+    case AUTO:
+      ESP_LOGE(TAG, "Image format could not be determined; set `format:` explicitly in the configuration");
+      return nullptr;
     default:
       ESP_LOGE(TAG, "Unsupported image format: %d", format);
       return nullptr;
