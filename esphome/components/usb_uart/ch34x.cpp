@@ -51,6 +51,8 @@ static const CH34xEntry CH34X_TABLE[] = {
 };
 
 bool USBUartTypeCH34X::config_device_step(uint8_t step, bool ok, const uint8_t *response) {
+  if (this->channels_.empty())
+    return false;
   if (step == 0) {
     // Vendor-specific GET_CHIP_VERSION request (bRequest=0x5F): returns chip ID bytes
     // used to distinguish CH34x variants sharing the same PID.
@@ -95,7 +97,7 @@ void USBUartTypeCH34X::dump_config() {
   ESP_LOGCONFIG(TAG, "  CH34x chip: %s", this->chip_name_);
 }
 
-bool USBUartTypeCH34X::config_step(USBUartChannel *channel, uint8_t step, bool reload, bool ok,
+bool USBUartTypeCH34X::config_step(USBUartChannelBase *channel, uint8_t step, bool reload, bool ok,
                                    const uint8_t *response) {
   uint8_t cmd = 0xA1 + channel->index_;
   if (channel->index_ >= 2)
