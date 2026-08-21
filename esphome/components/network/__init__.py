@@ -17,8 +17,21 @@ from esphome.core import CORE, CoroPriority, coroutine_with_priority
 import esphome.final_validate as fv
 from esphome.types import ConfigType
 
+from .const import CONF_ENABLE_IPV4
+
 CODEOWNERS = ["@esphome/core"]
 AUTO_LOAD = ["mdns"]
+
+# Lists will be updated in future PRs as IPV4 requirement removed from denied components
+_DISABLE_IPV4_DENY_LIST = [
+    "esp32_improv",
+    "ethernet",
+    "modem",
+    "mqtt",
+    "udp",
+    "wifi",
+    "wireguard",
+]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -197,6 +210,13 @@ def validate_ipv6(value: bool) -> bool:
     return value
 
 
+def validate_ipv4(value: bool) -> bool:
+    if CORE.is_nrf52 and value:
+        raise cv.Invalid("On nRF52, enable_ipv4 must be false")
+
+    return value
+
+
 def get_network_priority(iface: str) -> float | None:
     """Get the setup priority for the given network interface type.
 
@@ -306,6 +326,15 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ENABLE_HIGH_PERFORMANCE): cv.All(
                 cv.boolean, cv.only_on_esp32
             ),
+            cv.SplitDefault(
+                CONF_ENABLE_IPV4,
+                bk72xx=True,
+                esp32=True,
+                esp8266=True,
+                host=True,
+                rp2=True,
+                nrf52=False,
+            ): cv.All(cv.boolean, validate_ipv4),
             cv.Optional(CONF_PRIORITY): _validate_priority_list,
         }
     ),
@@ -314,12 +343,22 @@ CONFIG_SCHEMA = cv.All(
 
 
 def _final_validate(config: ConfigType) -> None:
-    """Check that every interface named in 'priority' has a corresponding component block."""
-    full = fv.full_config.get()
+    full_config = fv.full_config.get()
+    enable_ipv4 = config.get(CONF_ENABLE_IPV4, True)
+    if not enable_ipv4:
+        if not CORE.is_esp32 and not CORE.is_nrf52:
+            raise cv.Invalid("Disabling IPv4 is only supported on ESP32 or Zephyr")
+        for comp in _DISABLE_IPV4_DENY_LIST:
+            if comp in full_config:
+                raise cv.Invalid(
+                    f"Disabling IPv4 is not currently compatible with component {comp}"
+                )
+
+    # Check that every interface named in 'priority' has a corresponding component block.
     priority_list = config.get(CONF_PRIORITY, [])
     for entry in priority_list:
         iface = entry["interface"]
-        if iface not in full:
+        if iface not in full_config:
             raise cv.Invalid(
                 f"'{iface}' is listed in 'network: priority:' but no '{iface}:' "
                 f"component is configured",
@@ -352,6 +391,8 @@ FINAL_VALIDATE_SCHEMA = _final_validate
 async def to_code(config):
     cg.add_define("USE_NETWORK")
     # ESP32 with Arduino uses ESP-IDF network APIs directly, no Arduino Network library needed
+    enable_ipv4 = config.get(CONF_ENABLE_IPV4, True)
+    enable_ipv6 = config.get(CONF_ENABLE_IPV6, None)
 
     # Store the user-declared network priority list in CORE.data so that ethernet,
     # wifi and other network components can query it via get_network_priority()
@@ -448,7 +489,8 @@ async def to_code(config):
 
     if CORE.is_nrf52:
         zephyr_add_prj_conf("NETWORKING", True)
-        zephyr_add_prj_conf("NET_IPV6", True)
+        zephyr_add_prj_conf("NET_IPV4", enable_ipv4)
+        zephyr_add_prj_conf("NET_IPV6", enable_ipv6)
         zephyr_add_prj_conf("NET_TCP", True)
         zephyr_add_prj_conf("NET_UDP", True)
         # The nRF Connect SDK replaces mbedTLS with PSA/Oberon crypto and does not provide the
@@ -473,7 +515,7 @@ async def to_code(config):
         zephyr_add_prj_conf("NET_TCP_MAX_RECV_WINDOW_SIZE", 2280)
         zephyr_add_prj_conf("NET_TCP_MAX_SEND_WINDOW_SIZE", 2280)
 
-    if (enable_ipv6 := config.get(CONF_ENABLE_IPV6, None)) is not None:
+    if enable_ipv6 is not None:
         cg.add_define("USE_NETWORK_IPV6", enable_ipv6)
         if enable_ipv6:
             cg.add_define(
@@ -501,6 +543,10 @@ async def to_code(config):
     # pointers via get_variable().
     if CORE.is_esp32:
         CORE.add_job(network_component_to_code, config)
+
+    cg.add_define("USE_NETWORK_IPV4", enable_ipv4)
+    if CORE.is_esp32:
+        add_idf_sdkconfig_option("CONFIG_LWIP_IPV4", enable_ipv4)
 
 
 @coroutine_with_priority(CoroPriority.NETWORK_SERVICES)
