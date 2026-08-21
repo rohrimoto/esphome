@@ -513,16 +513,28 @@ ESP32_PLATFORMIO_TRIGGER_FILES = frozenset(
 )
 
 
+def _path_or_file_trigger(
+    files: list[str],
+    trigger_files: frozenset[str],
+    trigger_prefixes: tuple[str, ...],
+) -> bool:
+    """Whether any changed file matches the given infrastructure triggers."""
+    return any(
+        file in trigger_files or file.startswith(trigger_prefixes) for file in files
+    )
+
+
+def _changed_components_closure(files: list[str]) -> set[str]:
+    """Dependency closure of the changed components, from the changed files."""
+    component_files = [f for f in files if filter_component_and_test_files(f)]
+    return set(get_components_with_dependencies(component_files, True))
+
+
 def _esp32_platformio_path_or_file_trigger(files: list[str]) -> bool:
     """Whether any changed file is a PlatformIO infrastructure / harness trigger."""
-    for file in files:
-        if file in ESP32_PLATFORMIO_TRIGGER_FILES:
-            return True
-        if any(
-            file.startswith(prefix) for prefix in ESP32_PLATFORMIO_TRIGGER_PATH_PREFIXES
-        ):
-            return True
-    return False
+    return _path_or_file_trigger(
+        files, ESP32_PLATFORMIO_TRIGGER_FILES, ESP32_PLATFORMIO_TRIGGER_PATH_PREFIXES
+    )
 
 
 # Native-build infra: changes under esphome/espidf/, the shared
@@ -543,14 +555,9 @@ ESP_IDF_INFRA_TRIGGER_FILES = frozenset(
 
 def _esp_idf_infra_changed(files: list[str]) -> bool:
     """Whether any changed file is ESP-IDF build/runner infrastructure."""
-    for file in files:
-        if file in ESP_IDF_INFRA_TRIGGER_FILES:
-            return True
-        if any(
-            file.startswith(prefix) for prefix in ESP_IDF_INFRA_TRIGGER_PATH_PREFIXES
-        ):
-            return True
-    return False
+    return _path_or_file_trigger(
+        files, ESP_IDF_INFRA_TRIGGER_FILES, ESP_IDF_INFRA_TRIGGER_PATH_PREFIXES
+    )
 
 
 def esp32_platformio_components_to_test(branch: str | None = None) -> list[str]:
@@ -593,10 +600,7 @@ def esp32_platformio_components_to_test(branch: str | None = None) -> list[str]:
     if core_changed(files) or _esp32_platformio_path_or_file_trigger(files):
         return sorted(ESP32_PLATFORMIO_TEST_COMPONENTS)
 
-    component_files = [f for f in files if filter_component_and_test_files(f)]
-    changed = get_components_with_dependencies(component_files, True)
-
-    return sorted(ESP32_PLATFORMIO_TEST_COMPONENTS & set(changed))
+    return sorted(ESP32_PLATFORMIO_TEST_COMPONENTS & _changed_components_closure(files))
 
 
 def should_run_esp32_platformio(branch: str | None = None) -> bool:
@@ -615,6 +619,75 @@ def should_run_esp32_platformio(branch: str | None = None) -> bool:
         True if the PlatformIO compile test should run, False otherwise.
     """
     return bool(esp32_platformio_components_to_test(branch))
+
+
+# Components tested by the native (PlatformIO-free) ESP8266 Arduino toolchain
+# compile-test job. The regular component matrix builds esp8266 with the
+# default platformio toolchain; this list is the `--toolchain arduino` smoke
+# test, chosen to exercise the core, the bundled libraries (ESP8266WiFi,
+# ESP8266mDNS, Wire, SPI, DNSServer, Hash), the converted registry libraries
+# (ESPAsyncTCP/WebServer, AsyncMqttClient, NeoPixelBus), and the waveform path.
+ESP8266_NATIVE_TEST_COMPONENTS = frozenset(
+    {
+        "esp8266",
+        "api",
+        "web_server",
+        "captive_portal",
+        "mqtt",
+        "esp8266_pwm",
+        "neopixelbus",
+        "bme280_i2c",
+        "uart",
+    }
+)
+
+# Infrastructure whose changes always trigger the native ESP8266 compile
+# test. esphome/build_helpers/ holds the idedata and size-summary helpers
+# the backend shares with the native ESP-IDF build.
+ESP8266_NATIVE_TRIGGER_PATH_PREFIXES = (
+    "esphome/arduino8266/",
+    "esphome/arduino/",
+    "esphome/build_helpers/",
+)
+ESP8266_NATIVE_TRIGGER_FILES = frozenset(
+    {
+        "esphome/build_gen/arduino8266.py",
+        "esphome/build_gen/build_tool.py",
+        "esphome/platformio/extra_script.py",
+        "esphome/components/esp8266/build_surgery.py",
+        "esphome/components/esp8266/boards.py",
+        "esphome/platformio/library.py",
+        "esphome/platformio/registry.py",
+        "esphome/platformio/toolchain.py",
+        "script/test_build_components.py",
+        ".github/workflows/ci.yml",
+    }
+)
+
+
+def _esp8266_native_path_or_file_trigger(files: list[str]) -> bool:
+    """Whether any changed file is native-ESP8266 infrastructure / harness."""
+    # base_python_changed covers the top-level esphome/*.py modules the
+    # native backend imports directly (framework_helpers, helpers, writer,
+    # __main__); without it a change there would silently skip this job.
+    return base_python_changed(files) or _path_or_file_trigger(
+        files, ESP8266_NATIVE_TRIGGER_FILES, ESP8266_NATIVE_TRIGGER_PATH_PREFIXES
+    )
+
+
+def esp8266_native_components_to_test(branch: str | None = None) -> list[str]:
+    """Subset of ``ESP8266_NATIVE_TEST_COMPONENTS`` the job needs to compile.
+
+    Same narrowing logic as ``esp32_platformio_components_to_test``: the full
+    list on core or infrastructure changes, otherwise the intersection with
+    the changed-component dependency closure (empty list skips the job).
+    """
+    files = changed_files(branch)
+
+    if core_changed(files) or _esp8266_native_path_or_file_trigger(files):
+        return sorted(ESP8266_NATIVE_TEST_COMPONENTS)
+
+    return sorted(ESP8266_NATIVE_TEST_COMPONENTS & _changed_components_closure(files))
 
 
 def determine_cpp_unit_tests(
@@ -1212,6 +1285,8 @@ def main() -> None:
         run_device_builder = True
         esp32_platformio_components = sorted(ESP32_PLATFORMIO_TEST_COMPONENTS)
         run_esp32_platformio = True
+        esp8266_native_components = sorted(ESP8266_NATIVE_TEST_COMPONENTS)
+        run_esp8266_native = True
     else:
         integration_run_all, integration_test_files = determine_integration_tests(
             args.branch
@@ -1223,6 +1298,8 @@ def main() -> None:
         run_device_builder = should_run_device_builder(args.branch)
         esp32_platformio_components = esp32_platformio_components_to_test(args.branch)
         run_esp32_platformio = bool(esp32_platformio_components)
+        esp8266_native_components = esp8266_native_components_to_test(args.branch)
+        run_esp8266_native = bool(esp8266_native_components)
     run_integration, integration_test_buckets = _compute_integration_test_buckets(
         integration_run_all, integration_test_files
     )
@@ -1417,6 +1494,8 @@ def main() -> None:
         "device_builder": run_device_builder,
         "esp32_platformio": run_esp32_platformio,
         "esp32_platformio_components": ",".join(esp32_platformio_components),
+        "esp8266_native": run_esp8266_native,
+        "esp8266_native_components": ",".join(esp8266_native_components),
         "changed_components": changed_components,
         "changed_components_with_tests": changed_components_with_tests,
         "directly_changed_components_with_tests": list(directly_changed_with_tests),

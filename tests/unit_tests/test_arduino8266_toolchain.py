@@ -1,0 +1,362 @@
+"""Tests for esphome.arduino8266.toolchain (the ninja build driver)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from esphome.arduino8266 import framework, toolchain
+from esphome.build_helpers.pio_options import warn_ignored_platformio_options
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_COMPILE_PROCESS_LIMIT,
+    CONF_ESPHOME,
+    KEY_CORE,
+    KEY_FRAMEWORK_VERSION,
+)
+from esphome.core import CORE, EsphomeError
+
+_SIZE_OUTPUT = """\
+firmware.elf  :
+section       size    addr
+.data         1924    1073643520
+.noinit       56      1073645444
+.text         496     1074790400
+.irom0.text   342804  1075843088
+.text1        27489   1074790896
+.rodata       2588    1073645504
+.bss          26504   1073648096
+Total         401861
+"""
+
+
+@pytest.fixture(autouse=True)
+def _setup_core(tmp_path: Path) -> None:
+    CORE.name = "test8266"
+    CORE.config_path = tmp_path / "test8266.yaml"
+    CORE.build_path = tmp_path
+    CORE.data[KEY_CORE] = {KEY_FRAMEWORK_VERSION: cv.Version(3, 1, 2)}
+
+
+def _paths(tmp_path: Path) -> framework.InstalledPaths:
+    return framework.InstalledPaths(
+        framework=tmp_path / "framework",
+        toolchain=tmp_path / "toolchain",
+        ninja=tmp_path / "ninja",
+    )
+
+
+def test_path_getters(tmp_path: Path) -> None:
+    assert toolchain.get_build_dir() == CORE.relative_pioenvs_path("test8266")
+    assert toolchain.get_elf_path().name == "firmware.elf"
+    # Pin both suffix variants so the test passes on every host platform
+    with patch.object(toolchain, "_EXE_SUFFIX", ""):
+        assert toolchain.get_addr2line_path().name == "xtensa-lx106-elf-addr2line"
+        assert toolchain.get_objdump_path().name == "xtensa-lx106-elf-objdump"
+        assert toolchain.get_readelf_path().name == "xtensa-lx106-elf-readelf"
+    # Windows binutils carry the executable suffix
+    with patch.object(toolchain, "_EXE_SUFFIX", ".exe"):
+        assert toolchain.get_addr2line_path().name == "xtensa-lx106-elf-addr2line.exe"
+
+
+def test_run_compile_build_failure(tmp_path: Path) -> None:
+    with (
+        patch.object(framework, "check_and_install", return_value=_paths(tmp_path)),
+        patch.object(framework, "get_build_env", return_value={}),
+        patch("esphome.build_gen.arduino8266.write_project"),
+        patch.object(
+            toolchain.subprocess, "run", return_value=MagicMock(returncode=2)
+        ) as mock_run,
+        patch.object(toolchain, "_write_compile_commands") as mock_compdb,
+    ):
+        assert toolchain.run_compile({CONF_ESPHOME: {}}, verbose=True) == 2
+    cmd = mock_run.call_args[0][0]
+    assert "-v" in cmd
+    # The compile database is generated before the build runs, so a failed
+    # build cannot leave a stale database behind.
+    mock_compdb.assert_called_once()
+
+
+def test_run_compile_success(tmp_path: Path) -> None:
+    with (
+        patch.object(framework, "check_and_install", return_value=_paths(tmp_path)),
+        patch.object(framework, "get_build_env", return_value={}),
+        patch("esphome.build_gen.arduino8266.write_project"),
+        patch.object(
+            toolchain.subprocess, "run", return_value=MagicMock(returncode=0)
+        ) as mock_run,
+        patch.object(toolchain, "_write_compile_commands") as mock_compdb,
+        patch.object(toolchain, "_print_size_summary") as mock_size,
+        patch.object(toolchain, "get_idedata") as mock_idedata,
+    ):
+        rc = toolchain.run_compile(
+            {CONF_ESPHOME: {CONF_COMPILE_PROCESS_LIMIT: 4}}, verbose=False
+        )
+    assert rc == 0
+    cmd = mock_run.call_args[0][0]
+    assert cmd[-2:] == ["-j", "4"]
+    mock_compdb.assert_called_once()
+    mock_size.assert_called_once()
+    mock_idedata.assert_called_once()
+
+
+def test_run_compile_warns_when_idedata_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed idedata generation right after a successful build is visible,
+    not deferred to a misleading error in a later command."""
+    with (
+        patch.object(framework, "check_and_install", return_value=_paths(tmp_path)),
+        patch.object(framework, "get_build_env", return_value={}),
+        patch("esphome.build_gen.arduino8266.write_project"),
+        patch.object(toolchain.subprocess, "run", return_value=MagicMock(returncode=0)),
+        patch.object(toolchain, "_write_compile_commands"),
+        patch.object(toolchain, "_print_size_summary"),
+        patch.object(toolchain, "get_idedata", return_value=None),
+    ):
+        assert toolchain.run_compile({CONF_ESPHOME: {}}, verbose=False) == 0
+    assert "Could not generate idedata" in caplog.text
+
+
+def test_write_compile_commands(tmp_path: Path) -> None:
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    with patch.object(
+        toolchain.subprocess,
+        "run",
+        return_value=MagicMock(returncode=0, stdout="[]\n"),
+    ):
+        toolchain._write_compile_commands(tmp_path / "ninja", build_dir, {})
+    assert (build_dir / "compile_commands.json").read_text() == "[]\n"
+
+
+def test_write_compile_commands_failure_removes_stale_db(tmp_path: Path) -> None:
+    """A failed compdb run must not leave a stale database behind."""
+    stale = tmp_path / "compile_commands.json"
+    stale.write_text("[]")
+    with (
+        patch.object(
+            toolchain.subprocess,
+            "run",
+            return_value=MagicMock(returncode=1, stderr="boom"),
+        ),
+        pytest.raises(EsphomeError, match="compile_commands"),
+    ):
+        toolchain._write_compile_commands(tmp_path / "ninja", tmp_path, {})
+    assert not stale.exists()
+
+
+def test_parse_app_size(tmp_path: Path) -> None:
+    ld = tmp_path / "eagle.flash.4m.ld"
+    ld.write_text("MEMORY\n{\n  irom0_0_seg :  org = 0x40201010, len = 0xfeff0\n}\n")
+    with patch("esphome.build_gen.arduino8266.get_flash_ld_path", return_value=ld):
+        assert toolchain._parse_app_size(tmp_path) == 0xFEFF0
+
+    ld.write_text("MEMORY { }\n")
+    with patch("esphome.build_gen.arduino8266.get_flash_ld_path", return_value=ld):
+        assert toolchain._parse_app_size(tmp_path) is None
+
+    # A zero-length segment is bad data, not a budget; warn and drop it
+    ld.write_text("MEMORY\n{\n  irom0_0_seg :  org = 0x40201010, len = 0x0\n}\n")
+    with patch("esphome.build_gen.arduino8266.get_flash_ld_path", return_value=ld):
+        assert toolchain._parse_app_size(tmp_path) is None
+
+    with patch(
+        "esphome.build_gen.arduino8266.get_flash_ld_path",
+        return_value=tmp_path / "missing.ld",
+    ):
+        assert toolchain._parse_app_size(tmp_path) is None
+
+
+def test_print_size_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with (
+        patch.object(
+            toolchain.subprocess,
+            "run",
+            return_value=MagicMock(returncode=0, stdout=_SIZE_OUTPUT),
+        ),
+        patch.object(toolchain, "_parse_app_size", return_value=1044464),
+    ):
+        toolchain._print_size_summary(tmp_path)
+    out = capsys.readouterr().out
+    # Exact PlatformIO shape so script/ci_memory_impact_extract.py can parse it
+    assert "RAM:   [====      ]  37.9% (used 31016 bytes from 81920 bytes)" in out
+    assert "Flash: [====      ]  35.9% (used 375301 bytes from 1044464 bytes)" in out
+
+
+def test_print_size_summary_no_app_size(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with (
+        patch.object(
+            toolchain.subprocess,
+            "run",
+            return_value=MagicMock(returncode=0, stdout=_SIZE_OUTPUT),
+        ),
+        patch.object(toolchain, "_parse_app_size", return_value=None),
+    ):
+        toolchain._print_size_summary(tmp_path)
+    out = capsys.readouterr().out
+    # Both lines are skipped together: a RAM line without Flash would skew
+    # CI's memory-impact sums across builds
+    assert out == ""
+
+
+def test_print_size_summary_size_tool_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with patch.object(
+        toolchain.subprocess,
+        "run",
+        return_value=MagicMock(returncode=1, stdout="", stderr="bad elf"),
+    ):
+        toolchain._print_size_summary(tmp_path)
+    assert capsys.readouterr().out == ""
+    assert "Could not summarize firmware size" in caplog.text
+
+
+def test_get_idedata_delegates(tmp_path: Path) -> None:
+    with (
+        patch(
+            "esphome.build_helpers.idedata.load_or_build_idedata",
+            return_value={"cc_path": "x"},
+        ) as mock_load,
+        patch.object(framework, "ccache_path", return_value=Path("/cc/ccache")),
+    ):
+        assert toolchain.get_idedata() == {"cc_path": "x"}
+    compile_commands, elf, cache = mock_load.call_args[0]
+    assert compile_commands.name == "compile_commands.json"
+    assert elf.name == "firmware.elf"
+    assert cache.name == "test8266.arduino.json"
+    # The exact configured launcher is passed for compile DB parsing
+    assert mock_load.call_args.kwargs["launcher"] == str(Path("/cc/ccache"))
+
+
+def test_get_idedata_no_ccache(tmp_path: Path) -> None:
+    with (
+        patch(
+            "esphome.build_helpers.idedata.load_or_build_idedata", return_value={}
+        ) as mock_load,
+        patch.object(framework, "ccache_path", return_value=None),
+    ):
+        toolchain.get_idedata()
+    assert mock_load.call_args.kwargs["launcher"] is None
+
+
+def test_run_compile_skips_compdb_when_ninja_unchanged(tmp_path: Path) -> None:
+    """An unchanged build.ninja means the compile DB is already current."""
+    build_dir = toolchain.get_build_dir()
+    build_dir.mkdir(parents=True)
+
+    def run(regenerate_expected: bool) -> None:
+        with (
+            patch.object(framework, "check_and_install", return_value=_paths(tmp_path)),
+            patch.object(framework, "get_build_env", return_value={}),
+            patch("esphome.build_gen.arduino8266.write_project", return_value=False),
+            patch.object(
+                toolchain.subprocess, "run", return_value=MagicMock(returncode=0)
+            ),
+            patch.object(toolchain, "_write_compile_commands") as mock_compdb,
+            patch.object(toolchain, "_print_size_summary"),
+            patch.object(toolchain, "get_idedata"),
+        ):
+            assert toolchain.run_compile({CONF_ESPHOME: {}}, verbose=False) == 0
+        assert mock_compdb.called == regenerate_expected
+
+    # Missing compile DB: regenerated even though build.ninja is unchanged
+    run(regenerate_expected=True)
+    # Present compile DB + unchanged build.ninja: skipped
+    (build_dir / "compile_commands.json").write_text("[]")
+    run(regenerate_expected=False)
+
+
+def test_print_size_summary_unparsable_section(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A totals-relevant section that fails to parse must not produce a
+    confident wrong number; an irrelevant one only warns."""
+    bad = _SIZE_OUTPUT.replace(".bss          26504", ".bss          abc")
+    with patch.object(
+        toolchain.subprocess,
+        "run",
+        return_value=MagicMock(returncode=0, stdout=bad),
+    ):
+        toolchain._print_size_summary(tmp_path)
+    assert capsys.readouterr().out == ""
+    assert "Unparsable size output" in caplog.text
+
+    caplog.clear()
+    harmless = _SIZE_OUTPUT + ".broken   abc   0\n"
+    with (
+        patch.object(
+            toolchain.subprocess,
+            "run",
+            return_value=MagicMock(returncode=0, stdout=harmless),
+        ),
+        patch.object(toolchain, "_parse_app_size", return_value=1044464),
+    ):
+        toolchain._print_size_summary(tmp_path)
+    assert "RAM:" in capsys.readouterr().out
+    assert "Unparsable size output" in caplog.text
+
+
+def test_print_size_summary_missing_section_skips_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A totals section absent from the output must not default to zero."""
+    without_bss = "\n".join(
+        line for line in _SIZE_OUTPUT.splitlines() if ".bss" not in line
+    )
+    with patch.object(
+        toolchain.subprocess,
+        "run",
+        return_value=MagicMock(returncode=0, stdout=without_bss),
+    ):
+        toolchain._print_size_summary(tmp_path)
+    assert capsys.readouterr().out == ""
+    assert "missing section(s) .bss" in caplog.text
+
+
+def test_warn_ignored_platformio_options(caplog: pytest.LogCaptureFixture) -> None:
+    """Component-added options the native build drops are warned by name."""
+    CORE.platformio_options = {
+        "board_build.ldscript": "eagle.flash.4m.ld",
+        "lib_ignore": ["Updater"],
+        "upload_speed": "460800",
+    }
+    warn_ignored_platformio_options(toolchain._CONSUMED_PIO_OPTIONS, "arduino")
+    assert "platformio_options->board_build.ldscript is ignored" in caplog.text
+    assert "native 'arduino' toolchain" in caplog.text
+    assert "lib_ignore" not in caplog.text
+    # Component-added upload_speed never gets read under the native
+    # toolchain, so it must warn
+    assert "upload_speed" in caplog.text
+
+
+def test_run_compile_idedata_error_does_not_fail_build(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unusable compile DB after a successful build warns, never fails."""
+    with (
+        patch.object(framework, "check_and_install", return_value=_paths(tmp_path)),
+        patch.object(framework, "get_build_env", return_value={}),
+        patch("esphome.build_gen.arduino8266.write_project"),
+        patch.object(toolchain.subprocess, "run", return_value=MagicMock(returncode=0)),
+        patch.object(toolchain, "_write_compile_commands"),
+        patch.object(toolchain, "_print_size_summary"),
+        patch.object(
+            toolchain,
+            "get_idedata",
+            side_effect=EsphomeError("compile database is unusable"),
+        ),
+    ):
+        assert toolchain.run_compile({CONF_ESPHOME: {}}, verbose=False) == 0
+    assert "Could not generate idedata: compile database is unusable" in caplog.text

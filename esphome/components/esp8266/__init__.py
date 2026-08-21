@@ -1,8 +1,10 @@
 import logging
+import math
 from pathlib import Path
 import platform
 import re
 import subprocess
+import time
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -13,6 +15,7 @@ from esphome.const import (
     CONF_FRAMEWORK,
     CONF_PLATFORM_VERSION,
     CONF_SOURCE,
+    CONF_TOOLCHAIN,
     CONF_VERSION,
     KEY_CORE,
     KEY_FRAMEWORK_VERSION,
@@ -20,6 +23,7 @@ from esphome.const import (
     KEY_TARGET_PLATFORM,
     PLATFORM_ESP8266,
     ThreadModel,
+    Toolchain,
 )
 from esphome.core import (
     CORE,
@@ -33,7 +37,7 @@ from esphome.helpers import IS_MACOS, copy_file_if_changed
 from esphome.platformio.toolchain import copy_ccache_script
 from esphome.types import ConfigType
 
-from .boards import BOARDS, ESP8266_LD_SCRIPTS
+from .boards import BOARDS, ESP8266_BOARD_BUILD, ESP8266_LD_SCRIPTS
 from .const import (
     CONF_EARLY_PIN_INIT,
     CONF_ENABLE_SERIAL,
@@ -41,8 +45,10 @@ from .const import (
     CONF_RESTORE_FROM_FLASH,
     KEY_BOARD,
     KEY_ESP8266,
+    KEY_FLASH_MODE,
     KEY_FLASH_SIZE,
     KEY_PIN_INITIAL_STATES,
+    KEY_SCANF_FLOAT,
     KEY_SERIAL1_REQUIRED,
     KEY_SERIAL_REQUIRED,
     KEY_WAVEFORM_REQUIRED,
@@ -96,9 +102,54 @@ def set_core_data(config):
         config[CONF_FRAMEWORK][CONF_VERSION]
     )
     CORE.data[KEY_ESP8266][KEY_BOARD] = config[CONF_BOARD]
+    CORE.data[KEY_ESP8266][KEY_FLASH_MODE] = config[CONF_BOARD_FLASH_MODE]
     CORE.data[KEY_ESP8266][KEY_PIN_INITIAL_STATES] = [
         PinInitialState() for _ in range(16)
     ]
+    return config
+
+
+_TOOLCHAINS = (Toolchain.PLATFORMIO, Toolchain.ARDUINO)
+_validate_toolchain = cv.toolchain_enum(_TOOLCHAINS)
+_resolve_toolchain = cv.resolve_toolchain("ESP8266", _TOOLCHAINS, Toolchain.PLATFORMIO)
+
+
+def _validate_native_toolchain(config: ConfigType) -> ConfigType:
+    """Constraints of the native (non-PlatformIO) Arduino toolchain."""
+    if not CORE.using_toolchain_arduino:
+        return config
+    from esphome.arduino8266.framework import MIN_FRAMEWORK_VERSION
+
+    conf = config[CONF_FRAMEWORK]
+    version = cv.Version.parse(conf[CONF_VERSION])
+    if version < MIN_FRAMEWORK_VERSION:
+        raise cv.Invalid(
+            "'toolchain: arduino' requires framework version "
+            f"{MIN_FRAMEWORK_VERSION} or newer"
+        )
+    # platform_version is a PlatformIO concept; drop it (as esp32's native
+    # toolchain does), warning when a custom pin is discarded. The floor
+    # above guarantees the schema-derived default is the ARDUINO_4 spec.
+    if conf.pop(CONF_PLATFORM_VERSION, None) != _ARDUINO_4_PLATFORM_SPEC:
+        _LOGGER.warning(
+            "'platform_version' is ignored by 'toolchain: arduino'; the native "
+            "toolchain downloads the framework and compiler directly"
+        )
+    if conf[CONF_SOURCE] != _format_framework_arduino_version(version):
+        raise cv.Invalid(
+            "'toolchain: arduino' does not support a custom framework source; "
+            "use 'toolchain: platformio'"
+        )
+    # BOARDS is a subset of ESP8266_BOARD_BUILD today; the second clause is
+    # a drift guard for the independently regenerated tables
+    if (
+        config[CONF_BOARD] not in BOARDS
+        or config[CONF_BOARD] not in ESP8266_BOARD_BUILD
+    ):
+        raise cv.Invalid(
+            f"Board '{config[CONF_BOARD]}' is not supported by "
+            "'toolchain: arduino'; use 'toolchain: platformio'"
+        )
     return config
 
 
@@ -135,7 +186,7 @@ def _format_framework_arduino_version(ver: cv.Version) -> str:
     if ver <= cv.Version(2, 6, 2):
         return f"~2.{ver.major}{ver.minor:02d}{ver.patch:02d}.0"
     # Same encoding the native toolchain uses for its package download, so a
-    # version bump cannot drift between the two paths.
+    # custom-source check against this value cannot drift from what it fetches.
     from esphome.arduino8266.framework import framework_package_version
 
     return f"~{framework_package_version(ver)}"
@@ -186,7 +237,7 @@ def _arduino_check_versions(value):
     platform_version = value.get(CONF_PLATFORM_VERSION)
     if platform_version is None:
         if version >= cv.Version(3, 1, 0):
-            platform_version = _parse_platform_version(str(ARDUINO_4_PLATFORM_VERSION))
+            platform_version = _ARDUINO_4_PLATFORM_SPEC
         elif version >= cv.Version(3, 0, 0):
             platform_version = _parse_platform_version(str(ARDUINO_3_PLATFORM_VERSION))
         elif version >= cv.Version(2, 5, 0):
@@ -211,6 +262,10 @@ def _parse_platform_version(value):
         return f"platformio/espressif8266@{value}"
     except cv.Invalid:
         return value
+
+
+# The platform_version derived for every core >= 3.1.0 config
+_ARDUINO_4_PLATFORM_SPEC = _parse_platform_version(str(ARDUINO_4_PLATFORM_VERSION))
 
 
 ARDUINO_FRAMEWORK_SCHEMA = cv.All(
@@ -246,13 +301,27 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ENABLE_SERIAL1): cv.boolean,
             cv.Optional(CONF_ENABLE_FULL_PRINTF, default=False): cv.boolean,
             cv.Optional(CONF_ENABLE_SCANF_FLOAT): cv.boolean,
+            cv.Optional(
+                CONF_TOOLCHAIN, visibility=cv.Visibility.ADVANCED
+            ): _validate_toolchain,
         }
     ),
-    # Until the native toolchain lands, PlatformIO is the only backend;
-    # reject a --toolchain this platform cannot serve yet.
-    cv.require_platformio_toolchain("ESP8266"),
+    _resolve_toolchain,
+    _validate_native_toolchain,
     set_core_data,
 )
+
+
+def native_toolchain_module():
+    """The native build backend for the resolved toolchain, if any.
+
+    Hook for ``__main__``'s shared dispatch (idedata, analyze_memory).
+    """
+    if not CORE.using_toolchain_arduino:
+        return None
+    from esphome.arduino8266 import toolchain
+
+    return toolchain
 
 
 def check_rosetta() -> None:
@@ -283,12 +352,13 @@ def check_rosetta() -> None:
 
 @coroutine_with_priority(CoroPriority.PLATFORM)
 async def to_code(config):
+    use_platformio = CORE.using_toolchain_platformio
     cg.add(esp8266_ns.setup_preferences())
 
-    cg.add_platformio_option("lib_ldf_mode", "off")
-    cg.add_platformio_option("lib_compat_mode", "strict")
-
-    cg.add_platformio_option("board", config[CONF_BOARD])
+    if use_platformio:
+        cg.add_platformio_option("lib_ldf_mode", "off")
+        cg.add_platformio_option("lib_compat_mode", "strict")
+        cg.add_platformio_option("board", config[CONF_BOARD])
     cg.add_build_flag("-DUSE_ESP8266")
     cg.set_cpp_standard("gnu++20")
     cg.add_define("ESPHOME_BOARD", config[CONF_BOARD])
@@ -304,28 +374,33 @@ async def to_code(config):
             "enabling scanf float support (~8KB flash)"
         )
 
-    extra_scripts = [
-        "pre:ccache.py",
-        "pre:testing_mode.py",
-        "pre:exclude_updater.py",
-        "pre:exclude_waveform.py",
-        "pre:relocate_ratetable.py",
-    ]
-    if not enable_scanf_float:
-        extra_scripts.append("pre:remove_float_scanf.py")
-    extra_scripts.append("post:post_build.py")
-    cg.add_platformio_option("extra_scripts", extra_scripts)
+    # The native toolchain reads this decision from CORE.data instead of the
+    # remove_float_scanf extra script.
+    CORE.data[KEY_ESP8266][KEY_SCANF_FLOAT] = bool(enable_scanf_float)
+    if use_platformio:
+        extra_scripts = [
+            "pre:ccache.py",
+            "pre:testing_mode.py",
+            "pre:exclude_updater.py",
+            "pre:exclude_waveform.py",
+            "pre:relocate_ratetable.py",
+        ]
+        if not enable_scanf_float:
+            extra_scripts.append("pre:remove_float_scanf.py")
+        extra_scripts.append("post:post_build.py")
+        cg.add_platformio_option("extra_scripts", extra_scripts)
 
     conf = config[CONF_FRAMEWORK]
-    cg.add_platformio_option("framework", "arduino")
     cg.add_build_flag("-DUSE_ARDUINO")
     cg.add_build_flag("-DUSE_ESP8266_FRAMEWORK_ARDUINO")
     cg.add_build_flag("-Wno-nonnull-compare")
-    cg.add_platformio_option("platform", conf[CONF_PLATFORM_VERSION])
-    cg.add_platformio_option(
-        "platform_packages",
-        [f"platformio/framework-arduinoespressif8266@{conf[CONF_SOURCE]}"],
-    )
+    if use_platformio:
+        cg.add_platformio_option("framework", "arduino")
+        cg.add_platformio_option("platform", conf[CONF_PLATFORM_VERSION])
+        cg.add_platformio_option(
+            "platform_packages",
+            [f"platformio/framework-arduinoespressif8266@{conf[CONF_SOURCE]}"],
+        )
 
     # Default for platformio is LWIP2_LOW_MEMORY with:
     #  - MSS=536
@@ -363,10 +438,12 @@ async def to_code(config):
     # Force-include inline std::__throw_* overrides so GCC dead-strips the unused
     # libstdc++ error message strings (e.g. "basic_string::_M_create") from DRAM.
     # See throw_stubs.h for details. Must be prepended before <string>, so this
-    # uses build_src_flags with -include.
-    cg.add_platformio_option(
-        "build_src_flags", "-include esphome/components/esp8266/throw_stubs.h"
-    )
+    # uses build_src_flags with -include. The native toolchain's build
+    # generator adds the equivalent flag itself.
+    if use_platformio:
+        cg.add_platformio_option(
+            "build_src_flags", "-include esphome/components/esp8266/throw_stubs.h"
+        )
 
     # In testing mode, fake larger memory to allow linking grouped component tests
     # Real ESP8266 hardware only has 32KB IRAM and ~80KB RAM, but for CI testing
@@ -393,7 +470,10 @@ async def to_code(config):
     # implementation in the Arduino ESP8266 core.
     cg.add_build_flag("-Wl,--wrap=millis")
 
-    cg.add_platformio_option("board_build.flash_mode", config[CONF_BOARD_FLASH_MODE])
+    if use_platformio:
+        cg.add_platformio_option(
+            "board_build.flash_mode", config[CONF_BOARD_FLASH_MODE]
+        )
 
     ver: cv.Version = CORE.data[KEY_CORE][KEY_FRAMEWORK_VERSION]
     cg.add_define(
@@ -401,7 +481,7 @@ async def to_code(config):
         cg.RawExpression(f"VERSION_CODE({ver.major}, {ver.minor}, {ver.patch})"),
     )
 
-    if config[CONF_BOARD] in BOARDS:
+    if use_platformio and config[CONF_BOARD] in BOARDS:
         flash_size = BOARDS[config[CONF_BOARD]][KEY_FLASH_SIZE]
         ld_scripts = ESP8266_LD_SCRIPTS[flash_size]
 
@@ -453,8 +533,26 @@ async def finalize_serial_config() -> None:
         cg.add_build_flag("-DNO_GLOBAL_SERIAL1")
 
 
+# Called by __main__.compile_program; returning False falls through to the
+# PlatformIO toolchain.
+def run_compile(args, config: ConfigType) -> bool:
+    # Positive check: the native backend only runs when explicitly resolved
+    if not CORE.using_toolchain_arduino:
+        return False
+    from esphome.arduino8266 import toolchain
+
+    if toolchain.run_compile(config, CORE.verbose) != 0:
+        raise EsphomeError("ESP8266 native build failed")
+    return True
+
+
 # Called by writer.py
 def copy_files() -> None:
+    # Positive check, matching run_compile: only the arduino native backend
+    # skips the PlatformIO/SCons extra scripts (their logic lives in the
+    # build generator there)
+    if CORE.using_toolchain_arduino:
+        return
     dir = Path(__file__).parent
     for script in (
         "post_build",
@@ -511,17 +609,54 @@ ESP8266_EXCEPTION_CODES = {
 }
 
 
-def _decode_pc(config, addr):
-    from esphome.platformio import toolchain
+_DECODE_WARNED_AT: dict[str, float] = {}
 
-    idedata = toolchain.get_idedata(config)
-    if not idedata.addr2line_path or not idedata.firmware_elf_path:
-        _LOGGER.debug("decode_pc no addr2line")
+
+def _warn_decode_problem(key: str, message: str, *args) -> None:
+    """Warn, deduplicated per stack dump but not per process.
+
+    A dump decodes dozens of addresses in a burst; one warning per burst is
+    enough. A long-running dashboard must still warn on the next dump, so
+    the suppression expires instead of living for the process lifetime.
+    """
+    now = time.monotonic()
+    if now - _DECODE_WARNED_AT.get(key, -math.inf) < 30:
         return
-    command = [idedata.addr2line_path, "-pfiaC", "-e", idedata.firmware_elf_path, addr]
+    _DECODE_WARNED_AT[key] = now
+    _LOGGER.warning(message, *args)
+
+
+def _decode_pc(config, addr):
+    if CORE.using_toolchain_arduino:
+        from esphome.arduino8266 import toolchain as native_toolchain
+
+        addr2line = native_toolchain.get_addr2line_path()
+        elf = native_toolchain.get_elf_path()
+        for path in (addr2line, elf):
+            if not path.is_file():
+                _warn_decode_problem(
+                    str(path), "Cannot decode crash addresses: %s missing", path
+                )
+                return
+        addr2line, elf = str(addr2line), str(elf)
+    else:
+        from esphome.platformio import toolchain
+
+        idedata = toolchain.get_idedata(config)
+        if not idedata.addr2line_path or not idedata.firmware_elf_path:
+            _LOGGER.debug("decode_pc no addr2line")
+            return
+        addr2line, elf = idedata.addr2line_path, idedata.firmware_elf_path
+    command = [addr2line, "-pfiaC", "-e", elf, addr]
     try:
         translation = subprocess.check_output(command, close_fds=False).decode().strip()
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-except
+    except Exception as err:  # noqa: BLE001  # pylint: disable=broad-except
+        # A present-but-failing addr2line (stale ELF, bad install) must be
+        # visible on either toolchain, matching the missing-tool warning
+        # above, and the cause must not need debug logging to see
+        _warn_decode_problem(
+            "addr2line-failed", "Could not decode crash address %s (%s)", addr, err
+        )
         _LOGGER.debug("Caught exception for command %s", command, exc_info=1)
         return
 

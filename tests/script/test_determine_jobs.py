@@ -79,6 +79,17 @@ def mock_esp32_platformio_components_to_test() -> Generator[Mock, None, None]:
 
 
 @pytest.fixture
+def mock_esp8266_native_components_to_test() -> Generator[Mock, None, None]:
+    """Mock esp8266_native_components_to_test from determine_jobs.
+
+    main() drives both the ``esp8266_native`` boolean output and the
+    ``esp8266_native_components`` CSV from this one function.
+    """
+    with patch.object(determine_jobs, "esp8266_native_components_to_test") as mock:
+        yield mock
+
+
+@pytest.fixture
 def mock_determine_cpp_unit_tests() -> Generator[Mock, None, None]:
     """Mock determine_cpp_unit_tests from helpers."""
     with patch.object(determine_jobs, "determine_cpp_unit_tests") as mock:
@@ -116,6 +127,7 @@ def test_main_all_tests_should_run(
     mock_should_run_import_time: Mock,
     mock_should_run_device_builder: Mock,
     mock_esp32_platformio_components_to_test: Mock,
+    mock_esp8266_native_components_to_test: Mock,
     mock_changed_files: Mock,
     mock_determine_cpp_unit_tests: Mock,
     capsys: pytest.CaptureFixture[str],
@@ -132,6 +144,7 @@ def test_main_all_tests_should_run(
     mock_should_run_import_time.return_value = True
     mock_should_run_device_builder.return_value = True
     mock_esp32_platformio_components_to_test.return_value = ["api", "esp32"]
+    mock_esp8266_native_components_to_test.return_value = ["api", "logger"]
     mock_determine_cpp_unit_tests.return_value = (False, ["wifi", "api", "sensor"])
 
     # Mock changed_files to return non-component files (to avoid memory impact)
@@ -215,6 +228,8 @@ def test_main_all_tests_should_run(
     assert output["device_builder"] is True
     assert output["esp32_platformio"] is True
     assert output["esp32_platformio_components"] == "api,esp32"
+    assert output["esp8266_native"] is True
+    assert output["esp8266_native_components"] == "api,logger"
     assert output["changed_components"] == ["wifi", "api", "sensor"]
     # changed_components_with_tests will only include components that actually have test files
     assert "changed_components_with_tests" in output
@@ -251,6 +266,7 @@ def test_main_no_tests_should_run(
     mock_should_run_import_time: Mock,
     mock_should_run_device_builder: Mock,
     mock_esp32_platformio_components_to_test: Mock,
+    mock_esp8266_native_components_to_test: Mock,
     mock_changed_files: Mock,
     mock_determine_cpp_unit_tests: Mock,
     capsys: pytest.CaptureFixture[str],
@@ -267,6 +283,7 @@ def test_main_no_tests_should_run(
     mock_should_run_import_time.return_value = False
     mock_should_run_device_builder.return_value = False
     mock_esp32_platformio_components_to_test.return_value = []
+    mock_esp8266_native_components_to_test.return_value = []
     mock_determine_cpp_unit_tests.return_value = (False, [])
 
     # Mock changed_files to return no component files
@@ -309,6 +326,8 @@ def test_main_no_tests_should_run(
     assert output["device_builder"] is False
     assert output["esp32_platformio"] is False
     assert output["esp32_platformio_components"] == ""
+    assert output["esp8266_native"] is False
+    assert output["esp8266_native_components"] == ""
     assert output["changed_components"] == []
     assert output["changed_components_with_tests"] == []
     assert output["component_test_count"] == 0
@@ -3078,3 +3097,70 @@ def test_memory_impact_elf_layouts_are_found(tmp_path: Path) -> None:
         elf.write_text("")
 
         assert find_elf_path(build_path) == elf, f"{platform} ELF not found"
+
+
+def test_esp8266_native_components_full_list_on_infra_change() -> None:
+    """Native-ESP8266 infrastructure changes run the full test list."""
+    for changed in (
+        ["esphome/arduino8266/framework.py"],
+        ["esphome/build_gen/arduino8266.py"],
+        ["esphome/components/esp8266/build_surgery.py"],
+        # Shared modules the native build depends on
+        ["esphome/build_helpers/idedata.py"],
+        ["esphome/platformio/library.py"],
+        # Top-level esphome/*.py modules the backend imports directly
+        ["esphome/framework_helpers.py"],
+        ["esphome/writer.py"],
+        # ccache_path imports from platformio/toolchain.py
+        ["esphome/platformio/toolchain.py"],
+    ):
+        with (
+            patch.object(determine_jobs, "changed_files", return_value=changed),
+            patch.object(
+                determine_jobs,
+                "get_components_with_dependencies",
+                return_value=["wifi"],
+            ),
+        ):
+            result = determine_jobs.esp8266_native_components_to_test()
+            assert result == sorted(determine_jobs.ESP8266_NATIVE_TEST_COMPONENTS)
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "dependency_closure", "expected"),
+    [
+        # Tested component changed -- narrow to the intersection.
+        (
+            ["esphome/components/mqtt/mqtt_client.cpp"],
+            ["mqtt", "json"],
+            ["mqtt"],
+        ),
+        # Components outside the test set return an empty list (job skipped).
+        (
+            ["esphome/components/wifi/wifi_component.cpp"],
+            ["wifi", "network"],
+            [],
+        ),
+        # espidf infrastructure is not an esp8266-native trigger; the
+        # native backend depends on esphome/build_helpers/ instead.
+        (["esphome/build_gen/espidf.py"], [], []),
+        (["esphome/espidf/toolchain.py"], [], []),
+        (["README.md"], [], []),
+    ],
+)
+def test_esp8266_native_components_to_test_narrowing(
+    changed_files: list[str],
+    dependency_closure: list[str],
+    expected: list[str],
+) -> None:
+    """Component changes narrow the native-ESP8266 test list."""
+    with (
+        patch.object(determine_jobs, "changed_files", return_value=changed_files),
+        patch.object(
+            determine_jobs,
+            "get_components_with_dependencies",
+            return_value=dependency_closure,
+        ),
+    ):
+        result = determine_jobs.esp8266_native_components_to_test()
+        assert result == expected
