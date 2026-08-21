@@ -855,7 +855,22 @@ def compile_program(args: ArgsProtocol, config: ConfigType) -> int:
         toolchain.create_factory_bin()
         toolchain.create_ota_bin()
         toolchain.create_elf_copy()
-        toolchain.get_idedata()
+        try:
+            if toolchain.get_idedata() is None:
+                _LOGGER.warning("No idedata was generated for this build")
+        except (
+            EsphomeError,
+            LookupError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as err:
+            # The firmware already built; idedata is a bonus artifact here.
+            # Broad on purpose: a vanished compiler (OSError), a failed
+            # include probe (RuntimeError), or a truncated compile DB
+            # (ValueError/LookupError) must not fail a successful build
+            # either.
+            _LOGGER.warning("Could not generate idedata: %s", err)
     else:
         from esphome.platformio import toolchain
 

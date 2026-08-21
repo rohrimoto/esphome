@@ -1,10 +1,10 @@
-"""Derive idedata from an ESP-IDF native-toolchain ``compile_commands.json``.
+"""Derive idedata from a native (non-PlatformIO) build's ``compile_commands.json``.
 
-PlatformIO exposes a curated ``pio run -t idedata`` JSON; the native ESP-IDF
-toolchain has no such command, but its CMake build emits
-``build/compile_commands.json`` (CMAKE_EXPORT_COMPILE_COMMANDS). This module
-turns that file into the same fields consumers (IDE integration, clang-tidy)
-expect:
+PlatformIO exposes a curated ``pio run -t idedata`` JSON; the native
+toolchains have no such command, but each build produces a
+``compile_commands.json`` (CMAKE_EXPORT_COMPILE_COMMANDS for ESP-IDF, ninja's
+compdb tool otherwise). This module turns that file into the same fields
+consumers (IDE integration, clang-tidy) expect:
 
     {cc_path, cxx_path, cxx_flags, defines, includes: {build, toolchain}}
 """
@@ -17,6 +17,9 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+
+from esphome.core import EsphomeError
+from esphome.helpers import write_file
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,7 +123,20 @@ def _pick_entry(entries: list[dict]) -> dict:
     raise ValueError("no C++ translation unit found in compile_commands.json")
 
 
-def _parse_entry(entry: dict) -> tuple[str, list[str], list[str], list[str]]:
+# Compiler launchers that may prefix a compile command. A closed denylist is
+# sturdier than trying to enumerate compiler names: launchers are few and
+# stable, while compilers (cross prefixes, versioned names, icx, armcc, ...)
+# are an open set.
+_LAUNCHER_STEMS = frozenset({"ccache", "sccache", "distcc", "icecc", "buildcache"})
+
+
+def _is_launcher(token: str) -> bool:
+    return Path(token).stem.lower() in _LAUNCHER_STEMS
+
+
+def parse_entry(
+    entry: dict, launcher: str | None = None
+) -> tuple[str, list[str], list[str], list[str]]:
     """Parse one compile_commands entry -> (cxx_path, defines, includes, cxx_flags)."""
     directory = Path(entry["directory"])
     tokens = _expand_response_files(_split_command(entry["command"]), directory)
@@ -136,6 +152,16 @@ def _parse_entry(entry: dict) -> tuple[str, list[str], list[str], list[str]]:
             raw = os.path.normpath(directory / raw)
         return raw.replace("\\", "/")
 
+    # A launcher-wrapped command ("ccache g++ ...") names the compiler
+    # second. The caller passes the exact launcher it configured into the
+    # build, so this is a comparison, not a guess by name.
+    if launcher is not None and tokens[0] == launcher:
+        tokens = tokens[1:]
+    if _is_launcher(tokens[0]) and len(tokens) > 1 and not tokens[1].startswith("-"):
+        # A stale compile DB built with a launcher the current run no longer
+        # configures: the real compiler is the next token.
+        _LOGGER.debug("Stripping unconfigured launcher %s", tokens[0])
+        tokens = tokens[1:]
     # token0 is the compiler path; the rest of the command already uses forward
     # slashes on Windows, so normalize it too for a consistent idedata file.
     cxx_path = tokens[0].replace("\\", "/")
@@ -168,7 +194,7 @@ def _parse_entry(entry: dict) -> tuple[str, list[str], list[str], list[str]]:
     return cxx_path, defines, includes, cxx_flags
 
 
-def _get_toolchain_includes(cxx_path: str) -> list[str]:
+def get_toolchain_includes(cxx_path: str) -> list[str]:
     """Query the compiler for its builtin ``#include <...>`` search dirs."""
     result = subprocess.run(
         [cxx_path, "-E", "-x", "c++", "-", "-v"],
@@ -219,24 +245,79 @@ def _cc_path_from_cxx(cxx_path: str) -> str:
     return f"{stem}{suffix}"
 
 
-def idedata_from_build(compile_commands: Path) -> dict:
+def load_or_build_idedata(
+    compile_commands: Path,
+    elf_path: Path,
+    cache: Path,
+    launcher: str | None = None,
+) -> dict | None:
+    """Return idedata for a compile_commands.json build, cached on mtime.
+
+    Shared by the native ESP-IDF and ESP8266 Arduino toolchains. Returns None
+    when the compile DB doesn't exist yet (nothing was built). ``launcher``
+    is the compiler-launcher path (ccache) the build was generated with, if
+    any; commands in the compile DB are prefixed with it.
+    """
+    if not compile_commands.is_file():
+        _LOGGER.debug("No %s yet; skipping idedata generation", compile_commands)
+        return None
+
+    if cache.is_file() and cache.stat().st_mtime >= compile_commands.stat().st_mtime:
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+        except ValueError as err:
+            # A recurring cause (interrupted write, disk full) would otherwise
+            # look like unexplained slow builds
+            _LOGGER.warning("Discarding unreadable idedata cache %s: %s", cache, err)
+        else:
+            # Caches written before cc_path was emitted stay newer than
+            # compile_commands.json forever, so rebuild them on the field rather
+            # than on the timestamp. Check the type too: a corrupted cache can
+            # still be valid JSON, and "in" would match a substring of a string.
+            if isinstance(cached, dict) and "cc_path" in cached:
+                return cached
+
+    data = idedata_from_build(compile_commands, launcher)
+    data["prog_path"] = str(elf_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic so a crash mid-write cannot leave a truncated cache
+    write_file(cache, json.dumps(data, indent=2) + "\n")
+    return data
+
+
+def idedata_from_build(compile_commands: Path, launcher: str | None = None) -> dict:
     """Parse compile_commands.json into the idedata fields consumers expect.
 
-    A single ESP-IDF compile entry only carries its own component's REQUIRES
-    include set, but consumers (clang-tidy) analyze ESPHome headers that
-    transitively pull in other components. So take cxx_path / cxx_flags /
-    defines from a representative ESPHome TU, but union the include dirs across
-    all ESPHome TUs to get a project-wide superset (as PlatformIO's idedata
-    provides).
+    A single compile entry only carries the include set its own translation
+    unit was built with (per-component under ESP-IDF), but consumers
+    (clang-tidy) analyze ESPHome headers that transitively pull in other
+    components. So take cxx_path / cxx_flags / defines from a representative
+    ESPHome TU, but union the include dirs across all ESPHome TUs to get a
+    project-wide superset (as PlatformIO's idedata provides).
     """
     entries = json.loads(Path(compile_commands).read_text(encoding="utf-8"))
-    cxx_path, defines, _, cxx_flags = _parse_entry(_pick_entry(entries))
 
-    build_includes: dict[str, None] = {}
+    representative = _pick_entry(entries)
+    cxx_path, defines, rep_includes, cxx_flags = parse_entry(representative, launcher)
+    if _is_launcher(cxx_path):
+        # Checked before the toolchain probe (which would fail opaquely on
+        # a launcher) so the unusable compile DB is named, and never
+        # cached or conflated with "nothing built yet"
+        raise EsphomeError(
+            f"compile_commands.json names the launcher {cxx_path} as the "
+            "compiler; the compile database is unusable"
+        )
+
+    # Seed with the representative's includes so it is not parsed twice
+    # (per-file -c/-o arguments make every command distinct, so memoizing
+    # whole commands would never hit)
+    build_includes: dict[str, None] = dict.fromkeys(
+        rep_includes if _is_esphome_src(representative["file"]) else ()
+    )
     for entry in entries:
-        if not _is_esphome_src(entry["file"]):
+        if entry is representative or not _is_esphome_src(entry["file"]):
             continue
-        for inc in _parse_entry(entry)[2]:
+        for inc in parse_entry(entry, launcher)[2]:
             build_includes.setdefault(inc, None)
 
     return {
@@ -246,6 +327,6 @@ def idedata_from_build(compile_commands: Path) -> dict:
         "defines": defines,
         "includes": {
             "build": list(build_includes),
-            "toolchain": _get_toolchain_includes(cxx_path),
+            "toolchain": get_toolchain_includes(cxx_path),
         },
     }
