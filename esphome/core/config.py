@@ -557,10 +557,14 @@ def _add_library_str(lib: str) -> None:
 
 @coroutine_with_priority(CoroPriority.FINAL)
 async def _add_platformio_options(pio_options: dict[str, str | list[str]]) -> None:
-    if CORE.using_toolchain_esp_idf:
-        # The native ESP-IDF build doesn't read platformio.ini; honor the
-        # options with a native equivalent and warn about the rest, which
-        # would otherwise be silently ignored.
+    if CORE.using_native_toolchain:
+        # The native builds don't read platformio.ini; honor the options
+        # with a native equivalent and warn about the rest, which would
+        # otherwise be silently ignored. Every dispatch site that tests a
+        # specific using_toolchain_* as a stand-in for "native" (project
+        # writing, compile, upload, firmware paths) must agree with this
+        # gate: a toolchain treated as native here must never fall through
+        # to a PlatformIO code path there.
         for key, val in pio_options.items():
             vals = [val] if isinstance(val, str) else val
             if key == CONF_BUILD_FLAGS:
@@ -573,23 +577,30 @@ async def _add_platformio_options(pio_options: dict[str, str | list[str]]) -> No
                 )
                 for flag in vals:
                     cg.add_build_flag(flag)
+            elif key == "build_unflags":
+                # Native equivalent: add_build_unflag (honored token-level by
+                # the arduino generator; the IDF generator warns there)
+                for flag in vals:
+                    CORE.add_build_unflag(flag)
             elif key == "lib_deps":
-                # Routed through the regular library mechanism so the libraries
-                # are converted to IDF components like any other PIO library
+                # Routed through the regular library mechanism so the
+                # libraries reach the native backend's converter (IDF
+                # components, or the ESP8266 native library resolution)
                 for lib in vals:
                     _add_library_str(lib)
             elif key == "lib_ignore":
-                # Read by the PIO-library-to-IDF-component conversion
-                # (generate_idf_components); filters both top-level libraries
-                # and dependencies discovered during conversion
+                # Read by the shared library conversion (lib_ignore_set in
+                # platformio/library.py); filters top-level libraries and
+                # discovered dependencies
                 cg.add_platformio_option(key, vals)
             elif key != "upload_speed":
                 # upload_speed needs no handling: it is read from the raw
                 # config at upload time (upload_using_esptool)
                 _LOGGER.warning(
                     "esphome->platformio_options->%s is ignored when building with "
-                    "the native ESP-IDF toolchain",
+                    "the native '%s' toolchain",
                     key,
+                    CORE.toolchain.value,
                 )
         return
     # Add includes at the very end, so that they override everything

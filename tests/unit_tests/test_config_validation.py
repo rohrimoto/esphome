@@ -3165,3 +3165,59 @@ def test_file__remapped_path_is_directory_raises(setup_core: Path) -> None:
 
     with pytest.raises(Invalid, match="is not a file"):
         cv.file_("/original/config/headers")
+
+
+def test_require_platformio_toolchain() -> None:
+    """Platforms with only the PlatformIO backend reject other toolchains."""
+    from esphome.const import Toolchain
+    from esphome.core import CORE
+
+    validator = cv.require_platformio_toolchain("RP2")
+    CORE.toolchain = None
+    config: dict = {}
+    assert validator(config) is config
+    assert CORE.toolchain == Toolchain.PLATFORMIO
+
+    CORE.toolchain = Toolchain.ARDUINO
+    with pytest.raises(Invalid, match="Unsupported toolchain 'arduino' for RP2"):
+        validator(config)
+
+
+def test_check_supported_toolchain_unresolved_is_an_ordering_bug() -> None:
+    """Calling the check before resolution fails naming the ordering bug,
+    not a user-facing unsupported-toolchain error."""
+    from esphome.const import Toolchain
+    from esphome.core import CORE
+
+    CORE.toolchain = None
+    with pytest.raises(Invalid, match="not resolved before RP2 validation"):
+        cv._check_supported_toolchain("RP2", (Toolchain.PLATFORMIO,))
+
+
+@pytest.mark.parametrize(
+    ("platform", "minimal_config"),
+    [
+        ("host", {}),
+        ("rp2", {"board": "rpipicow"}),
+        ("bk72xx", {"board": "generic-bk7231n-qfn32-tuya"}),
+        ("rtl87xx", {"board": "generic-rtl8710bn-2mb-788k"}),
+        ("ln882x", {"board": "generic-ln882h"}),
+        # The legacy stub platform must reject too, not just the chip families
+        ("libretiny", {}),
+    ],
+)
+def test_every_platformio_only_platform_rejects_arduino_toolchain(
+    platform: str, minimal_config: dict
+) -> None:
+    """The invariant every native-toolchain gate relies on: a platform that
+    cannot serve a CLI toolchain rejects it at validation (esp32, esp8266,
+    and nrf52 pin this in their own suites)."""
+    import importlib
+
+    from esphome.const import Toolchain
+    from esphome.core import CORE
+
+    module = importlib.import_module(f"esphome.components.{platform}")
+    CORE.toolchain = Toolchain.ARDUINO
+    with pytest.raises(Invalid, match="Unsupported toolchain 'arduino'"):
+        module.CONFIG_SCHEMA(dict(minimal_config))
