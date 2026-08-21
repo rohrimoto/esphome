@@ -558,6 +558,17 @@ def test_join_flag_args_trailing_bare_flag_warns(
     assert "Ignoring trailing '-l'" in caplog.text
 
 
+def test_lex_build_flags_dangling_flag_does_not_cross_entries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each entry is lexed independently, as ParseFlags does: a dangling -I
+    ending one entry warns instead of absorbing the next entry's first token."""
+    from esphome.platformio.library import lex_build_flags
+
+    assert lex_build_flags(["-Wall -I", "-DFOO=1"], "lib x") == ["-Wall", "-DFOO=1"]
+    assert "Ignoring trailing '-I'" in caplog.text
+
+
 def test_split_flag_entry_non_string_is_clean() -> None:
     """A dict or number from a third-party manifest fails naming the entry,
     not with an opaque shlex traceback."""
